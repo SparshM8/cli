@@ -1428,6 +1428,9 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 		return false, nil
 	}
 
+	// Content-free adoption signal (opt-in telemetry gated inside).
+	emitCheckpointCondensedTelemetry(ctx, state, result)
+
 	// Track this shadow branch for cleanup
 	shadowBranchesToDelete[shadowBranchName] = struct{}{}
 
