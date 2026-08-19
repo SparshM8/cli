@@ -688,6 +688,10 @@ type postCommitActionHandler struct {
 	// state; the PostCommit loop forwards them to telemetry after the
 	// session's MutateSessionState saves.
 	newSkillEvents []agent.SkillEvent
+	// condensedSignal is the missed-opportunity adoption signal snapshotted
+	// by condensation; emitted by the PostCommit loop after the session's
+	// MutateSessionState saves.
+	condensedSignal *condensedTelemetrySignal
 }
 
 // parentCommitHash returns the first parent's hash as a string, or empty for initial commits.
@@ -711,7 +715,7 @@ func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
 	)
 
 	if shouldCondense {
-		h.condensed, h.newSkillEvents = h.s.condenseAndUpdateState(h.ctx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet, condenseOpts{
+		h.condensed, h.newSkillEvents, h.condensedSignal = h.s.condenseAndUpdateState(h.ctx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet, condenseOpts{
 			shadowRef:        h.shadowRef,
 			headTree:         h.headTree,
 			parentTree:       h.parentTree,
@@ -740,7 +744,7 @@ func (h *postCommitActionHandler) HandleCondenseIfFilesTouched(state *session.St
 	)
 
 	if shouldCondense {
-		h.condensed, h.newSkillEvents = h.s.condenseAndUpdateState(h.ctx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet, condenseOpts{
+		h.condensed, h.newSkillEvents, h.condensedSignal = h.s.condenseAndUpdateState(h.ctx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet, condenseOpts{
 			shadowRef:        h.shadowRef,
 			headTree:         h.headTree,
 			parentTree:       h.parentTree,
@@ -1006,8 +1010,9 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		sessionID := sess.SessionID
 		iterCtx, iterSpan := processSessionsLoop.Iteration(loopCtx)
 		var newSkillEvents []agent.SkillEvent
+		var condensedSignal *condensedTelemetrySignal
 		stateSaved, mutErr := MutateSessionStateSaved(iterCtx, sessionID, func(state *SessionState) error {
-			newSkillEvents = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
+			newSkillEvents, condensedSignal = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
 				head, commit, newHead, worktreePath, headTree, parentTree,
 				committedFileSet, shadowBranchesToDelete, uncondensedActiveOnBranch, allAgentFiles,
 				sessionsWithCommittedFiles)
@@ -1020,6 +1025,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		}
 		if stateSaved {
 			EmitSkillInvocationTelemetry(iterCtx, newSkillEvents)
+			emitCheckpointCondensedTelemetry(iterCtx, condensedSignal)
 		}
 		iterSpan.End()
 	}
@@ -1206,7 +1212,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	uncondensedActiveOnBranch map[string]bool,
 	allAgentFiles map[string]struct{},
 	sessionsWithCommittedFiles int,
-) (newSkillEvents []agent.SkillEvent) {
+) (newSkillEvents []agent.SkillEvent, condensedSignal *condensedTelemetrySignal) {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
 	shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
 	reservedCheckpointID := state.PendingCondensationID()
@@ -1216,7 +1222,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 			slog.String("reserved_checkpoint_id", reservedCheckpointID.String()),
 			slog.String("commit_checkpoint_id", checkpointID.String()))
 		uncondensedActiveOnBranch[shadowBranchName] = true
-		return newSkillEvents
+		return newSkillEvents, condensedSignal
 	}
 
 	// Pre-resolve shadow branch ref and tree for this session.
@@ -1393,7 +1399,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 		uncondensedActiveOnBranch[shadowBranchName] = true
 	}
 
-	return handler.newSkillEvents
+	return handler.newSkillEvents, handler.condensedSignal
 }
 
 // condenseAndUpdateState runs condensation for a session and updates state afterward.
@@ -1409,7 +1415,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 	shadowBranchesToDelete map[string]struct{},
 	committedFiles map[string]struct{},
 	opts ...condenseOpts,
-) (condensed bool, newSkillEvents []agent.SkillEvent) {
+) (condensed bool, newSkillEvents []agent.SkillEvent, condensedSignal *condensedTelemetrySignal) {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
 	result, err := s.CondenseSession(ctx, repo, checkpointID, state, committedFiles, opts...)
 	if err != nil {
@@ -1417,7 +1423,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 			slog.String("session_id", state.SessionID),
 			slog.String("error", err.Error()),
 		)
-		return false, nil
+		return false, nil, nil
 	}
 
 	if result.Skipped {
@@ -1425,11 +1431,14 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 			slog.String("session_id", state.SessionID),
 			slog.String("checkpoint_id", checkpointID.String()),
 		)
-		return false, nil
+		return false, nil, nil
 	}
 
-	// Content-free adoption signal (opt-in telemetry gated inside).
-	emitCheckpointCondensedTelemetry(ctx, state, result)
+	// Snapshot the content-free adoption signal now (cheap, I/O-free); the
+	// PostCommit loop emits it after this session's gate releases, alongside
+	// the skill events — settings load, git-log probe, and detached spawn
+	// must not extend the lock hold.
+	condensedSignal = newCondensedTelemetrySignal(state, result)
 
 	// Track this shadow branch for cleanup
 	shadowBranchesToDelete[shadowBranchName] = struct{}{}
@@ -1465,7 +1474,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 		slog.Int("transcript_lines", result.TotalTranscriptLines),
 	)
 
-	return true, result.NewSkillEvents
+	return true, result.NewSkillEvents, condensedSignal
 }
 
 // updateBaseCommitIfChanged updates BaseCommit to newHead if it changed.
