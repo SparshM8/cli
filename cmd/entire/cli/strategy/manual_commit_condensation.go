@@ -1693,6 +1693,13 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 		state.PendingPromptAttribution = nil
 		return nil
 	}, func() {
+		// Skill telemetry only. emitCommitCondensedTelemetry is deliberately
+		// NOT called here: its payload is commit-scoped (files_committed counts a
+		// commit's files, and prior_ai_history's git-log probe uses --skip=1 to
+		// exclude the commit just made). This path condenses without a commit —
+		// doctor repairing an uncondensed session — so those fields would be
+		// meaningless and --skip=1 would exclude an unrelated HEAD. See
+		// newCommitCondensedSignal.
 		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	})
 	if errors.Is(mutErr, ErrStateNotFound) {
@@ -1867,6 +1874,9 @@ func (s *ManualCommitStrategy) CondenseAndMarkFullyCondensed(ctx context.Context
 		didCondense = true
 		return nil
 	}, func() {
+		// Skill telemetry only — same reason as CondenseSessionByID: this
+		// condenses the work left over after the last commit, so there is no
+		// commit for the commit-condensed signal to describe.
 		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	})
 	if errors.Is(mutErr, ErrStateNotFound) {
