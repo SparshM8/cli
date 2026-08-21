@@ -130,8 +130,10 @@ func newCommitCondensedSignal(state *SessionState, result *CondenseResult) *comm
 // Gated on both the env opt-out and the opt-in telemetry setting before any
 // work happens — an opted-out user never pays for the git-log density probe —
 // and best-effort throughout: the PostHog call happens in a detached child and
-// never blocks the hook. Call it AFTER the surrounding MutateSessionState
-// returns, never inside its closure.
+// never blocks the hook. Hand it to MutateSessionStateOnSaved as the post-save
+// effect rather than calling it inside the mutation closure — that runs it
+// outside the session gate, and only once the condensation it reports was
+// actually persisted.
 func emitCommitCondensedTelemetry(ctx context.Context, sig *commitCondensedSignal) {
 	if sig == nil {
 		return

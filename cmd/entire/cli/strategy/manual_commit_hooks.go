@@ -1011,21 +1011,20 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		iterCtx, iterSpan := processSessionsLoop.Iteration(loopCtx)
 		var newSkillEvents []agent.SkillEvent
 		var condensedSignal *commitCondensedSignal
-		stateSaved, mutErr := MutateSessionStateSaved(iterCtx, sessionID, func(state *SessionState) error {
+		mutErr := MutateSessionStateOnSaved(iterCtx, sessionID, func(state *SessionState) error {
 			newSkillEvents, condensedSignal = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
 				head, commit, newHead, worktreePath, headTree, parentTree,
 				committedFileSet, shadowBranchesToDelete, uncondensedActiveOnBranch, allAgentFiles,
 				sessionsWithCommittedFiles)
 			return nil
+		}, func() {
+			EmitSkillInvocationTelemetry(iterCtx, newSkillEvents)
+			emitCommitCondensedTelemetry(iterCtx, condensedSignal)
 		})
 		if mutErr != nil && !errors.Is(mutErr, ErrStateNotFound) {
 			logging.Warn(logCtx, "post-commit: session mutation failed",
 				slog.String("session_id", sessionID),
 				slog.String("error", mutErr.Error()))
-		}
-		if stateSaved {
-			EmitSkillInvocationTelemetry(iterCtx, newSkillEvents)
-			emitCommitCondensedTelemetry(iterCtx, condensedSignal)
 		}
 		iterSpan.End()
 	}

@@ -1641,7 +1641,7 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 	var shadowBranchName string
 	var clearAfter bool
 	var newSkillEvents []agent.SkillEvent
-	stateSaved, mutErr := MutateSessionStateSaved(ctx, sessionID, func(state *SessionState) error {
+	mutErr := MutateSessionStateOnSaved(ctx, sessionID, func(state *SessionState) error {
 		if state.PendingCondensationID() != checkpointID {
 			return ErrMutationSkip
 		}
@@ -1692,15 +1692,14 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 		state.PromptAttributions = nil
 		state.PendingPromptAttribution = nil
 		return nil
+	}, func() {
+		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	})
 	if errors.Is(mutErr, ErrStateNotFound) {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
 	if mutErr != nil {
 		return mutErr
-	}
-	if stateSaved {
-		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	}
 
 	if clearAfter {
@@ -1820,7 +1819,7 @@ func (s *ManualCommitStrategy) CondenseAndMarkFullyCondensed(ctx context.Context
 
 	var didCondense bool
 	var newSkillEvents []agent.SkillEvent
-	stateSaved, mutErr := MutateSessionStateSaved(ctx, sessionID, func(state *SessionState) error {
+	mutErr := MutateSessionStateOnSaved(ctx, sessionID, func(state *SessionState) error {
 		var preflightErr error
 		shadowBranchName, shouldCondense, preflightErr = prepareEagerCondensation(logCtx, repo, state)
 		if preflightErr != nil || !shouldCondense {
@@ -1867,15 +1866,14 @@ func (s *ManualCommitStrategy) CondenseAndMarkFullyCondensed(ctx context.Context
 		)
 		didCondense = true
 		return nil
+	}, func() {
+		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	})
 	if errors.Is(mutErr, ErrStateNotFound) {
 		return nil
 	}
 	if mutErr != nil {
 		return fmt.Errorf("failed to save session state: %w", mutErr)
-	}
-	if stateSaved {
-		EmitSkillInvocationTelemetry(ctx, newSkillEvents)
 	}
 
 	if didCondense && shadowBranchName != "" {
