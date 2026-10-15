@@ -16,7 +16,7 @@ import (
 	"github.com/entireio/cli/internal/coreapi"
 )
 
-// semanticSearchV4CellTimeout bounds each per-cell v4 query (token exchange +
+// semanticSearchV4CellTimeout bounds each per-cell v4 query (login refresh +
 // the query-serve call), mirroring codeSearchCellTimeout.
 const semanticSearchV4CellTimeout = 30 * time.Second
 
@@ -38,11 +38,23 @@ func newSemanticSearcher(insecureHTTP bool) semanticSearcher {
 	return s.search
 }
 
+// hintError swaps in a friendlier user-facing message while keeping the
+// underlying typed errors matchable with errors.Is/As — search outcome
+// telemetry classifies failures from the error chain (ENT-1938), so a hint
+// must never truncate it.
+type hintError struct {
+	msg  string
+	errs []error
+}
+
+func (e *hintError) Error() string   { return e.msg }
+func (e *hintError) Unwrap() []error { return e.errs }
+
 // loginHintErr maps auth.ErrNotLoggedIn to the standard login hint; other
 // errors pass through unchanged.
 func loginHintErr(err error) error {
 	if errors.Is(err, auth.ErrNotLoggedIn) {
-		return errors.New("not authenticated. Run 'entire login' to authenticate")
+		return &hintError{msg: "not authenticated. Run 'entire login' to authenticate", errs: []error{err}}
 	}
 	return err
 }
@@ -51,9 +63,9 @@ func loginHintErr(err error) error {
 // path. Control-plane discovery (the repo index, per-slug repo lookups, the
 // cluster catalog) is stable for the life of one command, so it is resolved
 // once and reused across TUI re-searches and pagination instead of paying
-// several network round trips per keystroke-search. Identity tokens are NOT
-// cached here — fanOutCells mints them per search (at most one per
-// jurisdiction), which keeps expiry handling in the auth layer.
+// several network round trips per keystroke-search. The login JWT is NOT
+// cached here — fanOutCells resolves and refreshes it per search, which keeps
+// expiry handling in the auth layer.
 type semanticSearchV4Session struct {
 	insecureHTTP bool
 
@@ -252,9 +264,11 @@ func (s *semanticSearchV4Session) resolveScope(ctx context.Context, slugs []stri
 }
 
 // lookupFilter resolves one repo filter to index entries, cached per session.
-// Matching mirrors resolveRepoFilters: a gh/ prefix is stripped, owner/name
-// matches full_name (case-insensitive, server-side exact match), and a raw
-// ULID matches the index entry's ID.
+// A slash-bearing filter goes to the exact-match ListRepos filter unchanged
+// (case-insensitive server-side): the control plane reads gh/owner/repo as
+// GitHub-only, et/project/repo as native-only, and a bare owner/repo as either
+// forge, so stripping the forge here would let a GitHub-origin search also
+// match a same-named native repo. A raw ULID matches the index entry's ID.
 func (s *semanticSearchV4Session) lookupFilter(ctx context.Context, filter string) ([]coreapi.RepoIndexEntry, error) {
 	s.mu.Lock()
 	if cached, ok := s.slugRepos[filter]; ok {
@@ -263,12 +277,11 @@ func (s *semanticSearchV4Session) lookupFilter(ctx context.Context, filter strin
 	}
 	s.mu.Unlock()
 
-	slug := strings.TrimPrefix(filter, "gh/")
 	var matched []coreapi.RepoIndexEntry
-	if strings.Contains(slug, "/") {
+	if strings.Contains(filter, "/") {
 		lookupCtx, cancel := context.WithTimeout(ctx, semanticSearchControlPlaneTimeout)
 		defer cancel()
-		out, err := s.coreClient.ListRepos(lookupCtx, coreapi.ListReposParams{Filter: coreapi.NewOptString(slug)})
+		out, err := s.coreClient.ListRepos(lookupCtx, coreapi.ListReposParams{Filter: coreapi.NewOptString(filter)})
 		if err != nil {
 			return nil, fmt.Errorf("semantic search: resolving repository %q: %w", filter, err)
 		}
@@ -327,7 +340,7 @@ func (c *cachedClusterClient) ListClusters(ctx context.Context) (*coreapi.ListCl
 	return out, nil
 }
 
-func (c *cachedClusterClient) GetRepo(ctx context.Context, params coreapi.GetRepoParams) (*coreapi.Repo, error) {
+func (c *cachedClusterClient) GetRepo(ctx context.Context, params coreapi.GetRepoParams) (*coreapi.RepoHeaders, error) {
 	return c.inner.GetRepo(ctx, params) //nolint:wrapcheck // transparent delegation
 }
 
@@ -373,11 +386,13 @@ type semanticCellPage struct {
 // mid-onboarding). Neither is worth warning the user about on every search.
 func classifySemanticCells(ctx context.Context, results []cellCallResult[*search.Response]) (pages []semanticCellPage, failed []string, lastErr error) {
 	var skipped, unmatched []string
+	var skipErrs []error
 	var unmatchedErr error
 	for _, r := range results {
 		switch {
 		case errors.Is(r.err, search.ErrCellUnavailable), errors.Is(r.err, auth.ErrNoCellForJurisdiction):
 			skipped = append(skipped, r.group.label())
+			skipErrs = append(skipErrs, r.err)
 		case errors.Is(r.err, search.ErrRepoFilterUnmatched):
 			// The cell answered; the repo filter just matched nothing there.
 			// Quiet like a skip when another cell has results, but if NO cell
@@ -406,7 +421,13 @@ func classifySemanticCells(ctx context.Context, results []cellCallResult[*search
 			// its region serves semantic search.
 			lastErr = errNoRepoAvailable
 		case len(skipped) > 0:
-			lastErr = errNoRegionAvailable
+			// Same message as the bare sentinel, but keep every per-cell skip
+			// cause in the chain: the two "region" variants (gateway without
+			// query-serve vs. client-side jurisdiction skip) are different
+			// failures and telemetry classifies them from the typed causes.
+			// All causes — not just the last — so a mixed-cause fan-out
+			// classifies by the classifier's precedence, not cell order.
+			lastErr = &hintError{msg: errNoRegionAvailable.Error(), errs: skipErrs}
 		}
 	}
 	return pages, failed, lastErr
@@ -414,10 +435,9 @@ func classifySemanticCells(ctx context.Context, results []cellCallResult[*search
 
 // errNoRepoAvailable is returned when at least one cell answered but none
 // matched the repo filter. A typo'd name or missing access cannot reach this
-// point — resolveScope already validated the slug against the control-plane
-// repo index — so the message names only the causes that survive: query-serve
-// hasn't indexed the repo, or its owner org isn't enabled for semantic search.
-var errNoRepoAvailable = errors.New("semantic search cannot search this repo yet — it may not be indexed, or semantic search may not be enabled for its owner")
+// point because resolveScope already validated the slug against the control-plane
+// repo index. The remaining cause is that query-serve has not indexed the repo.
+var errNoRepoAvailable = errors.New("semantic search cannot search this repo yet — it may not be indexed")
 
 // errNoRegionAvailable is returned when every queried cell lacks query-serve.
 var errNoRegionAvailable = errors.New("semantic search is not yet available in the region(s) hosting this search")

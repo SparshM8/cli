@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/codex"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
@@ -28,6 +30,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 
 	// Register agents so GetByAgentType works in tests.
+	_ "github.com/entireio/cli/cmd/entire/cli/agent/antigravity"
 	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	_ "github.com/entireio/cli/cmd/entire/cli/agent/copilotcli"
 	_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"
@@ -51,7 +54,7 @@ func writeStrategyExternalSummaryAgentBinary(t *testing.T, dir, name string) {
 	script := `#!/bin/sh
 case "$1" in
   info)
-    echo '{"protocol_version":1,"name":"` + name + `","type":"` + name + ` Agent","description":"External summary test agent","is_preview":false,"protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":false,"text_generator":true,"hook_response_writer":false,"subagent_aware_extractor":false}}'
+    echo '{"protocol_version":1,"name":"` + name + `","type":"` + name + ` Agent","description":"External summary test agent","protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":false,"text_generator":true,"hook_response_writer":false,"subagent_aware_extractor":false}}'
     ;;
   detect)
     echo '{"present": true}'
@@ -114,7 +117,14 @@ func TestBuildSummaryGenerator_ExternalProvider(t *testing.T) { //nolint:paralle
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".entire"), 0o755))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(dir, ".entire", "settings.json"),
-		[]byte(`{"enabled":true,"external_agents":true,"summary_generation":{"provider":"`+provider+`","model":"test-model"}}`),
+		[]byte(`{"enabled":true,"summary_generation":{"provider":"`+provider+`","model":"test-model"}}`),
+		0o644,
+	))
+	// external_agents lives in the local file: it grants execution of
+	// entire-agent-* binaries on $PATH, so the loader honors it only there.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, ".entire", "settings.local.json"),
+		[]byte(`{"external_agents":true}`),
 		0o644,
 	))
 
@@ -252,6 +262,97 @@ func TestCountTranscriptItems_CursorEmpty(t *testing.T) {
 	}
 }
 
+func TestNonCopilotCondensationPreservesSessionTokenUsage(t *testing.T) {
+	t.Parallel()
+
+	sessionUsage := &agent.TokenUsage{
+		InputTokens:         10_000,
+		OutputTokens:        999,
+		CacheReadTokens:     2_000,
+		CacheCreationTokens: 500,
+		APICallCount:        42,
+	}
+	state := &SessionState{
+		SessionID:  "s1",
+		AgentType:  agent.AgentTypeClaudeCode,
+		TokenUsage: sessionUsage,
+	}
+	checkpointUsage := &agent.TokenUsage{
+		InputTokens:         100,
+		OutputTokens:        10,
+		CacheReadTokens:     20,
+		CacheCreationTokens: 5,
+		APICallCount:        1,
+	}
+
+	applyBackfilledSessionTokenUsage(t.Context(), nil, state, nil, checkpointUsage)
+
+	require.Equal(t, sessionUsage, state.TokenUsage)
+}
+
+func TestNonCopilotCondensationDoesNotPromoteCheckpointUsage(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{
+		SessionID: "s1",
+		AgentType: agent.AgentTypeClaudeCode,
+	}
+	checkpointUsage := &agent.TokenUsage{
+		InputTokens:  100,
+		OutputTokens: 10,
+		APICallCount: 1,
+	}
+
+	applyBackfilledSessionTokenUsage(t.Context(), nil, state, nil, checkpointUsage)
+
+	require.Nil(t, state.TokenUsage)
+}
+
+func TestCondenseSessionByID_NonCopilotPreservesSessionTokenUsage(t *testing.T) { //nolint:paralleltest // uses t.Chdir
+	dir := setupGitRepo(t)
+	t.Chdir(dir)
+
+	s := &ManualCommitStrategy{}
+	sessionID := "non-copilot-token-usage"
+	metadataDir := paths.SessionMetadataDirFromSessionID(sessionID)
+
+	transcript := strings.Join([]string{
+		`{"type":"human","uuid":"u1","message":{"content":"hello"}}`,
+		`{"type":"assistant","uuid":"u2","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":10}}}`,
+	}, "\n") + "\n"
+	testutil.WriteFile(t, dir, filepath.Join(metadataDir, paths.TranscriptFileName), transcript)
+	testutil.WriteFile(t, dir, "test.txt", "agent content")
+
+	sessionUsage := &agent.TokenUsage{
+		InputTokens:         10_000,
+		OutputTokens:        999,
+		CacheReadTokens:     2_000,
+		CacheCreationTokens: 500,
+		APICallCount:        42,
+	}
+	require.NoError(t, s.SaveStep(t.Context(), StepContext{
+		SessionID:     sessionID,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "Checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
+		AgentType:     agent.AgentTypeClaudeCode,
+		TokenUsage:    sessionUsage,
+	}))
+
+	state, err := s.loadSessionState(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, sessionUsage, state.TokenUsage)
+
+	require.NoError(t, s.CondenseSessionByID(t.Context(), sessionID))
+
+	state, err = s.loadSessionState(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, sessionUsage, state.TokenUsage)
+	require.Nil(t, state.CheckpointTokenUsage)
+}
+
 func TestSessionStateBackfillTokenUsage_CopilotUsesZeroInputSessionAggregate(t *testing.T) {
 	t.Parallel()
 
@@ -276,6 +377,52 @@ func TestSessionStateBackfillTokenUsage_CopilotUsesZeroInputSessionAggregate(t *
 	require.Equal(t, 20, backfillUsage.CacheReadTokens)
 	require.Equal(t, 10, backfillUsage.CacheCreationTokens)
 	require.Equal(t, 3, backfillUsage.APICallCount)
+}
+
+func TestSessionStateBackfillTokenUsage_CopilotFallsBackToCheckpointUsage(t *testing.T) {
+	t.Parallel()
+
+	checkpointUsage := &agent.TokenUsage{
+		OutputTokens: 25,
+		APICallCount: 1,
+	}
+
+	backfillUsage := sessionStateBackfillTokenUsage(
+		t.Context(), nil, agent.AgentTypeCopilotCLI, nil, checkpointUsage,
+	)
+
+	require.Same(t, checkpointUsage, backfillUsage)
+}
+
+func TestApplyBackfilledSessionTokenUsage_CopilotPreservesSubagentTotal(t *testing.T) {
+	t.Parallel()
+
+	checkpointUsage := &agent.TokenUsage{
+		OutputTokens: 25,
+		APICallCount: 1,
+	}
+	state := &SessionState{
+		AgentType: agent.AgentTypeCopilotCLI,
+		TokenUsage: &agent.TokenUsage{
+			InputTokens: 1_000,
+			SubagentTokens: &agent.TokenUsage{
+				InputTokens:  200,
+				OutputTokens: 50,
+				APICallCount: 2,
+			},
+		},
+	}
+
+	applyBackfilledSessionTokenUsage(t.Context(), nil, state, nil, checkpointUsage)
+
+	require.Equal(t, 25, state.TokenUsage.OutputTokens)
+	require.Equal(t, 1, state.TokenUsage.APICallCount)
+	require.Equal(t, &agent.TokenUsage{
+		InputTokens:  200,
+		OutputTokens: 50,
+		APICallCount: 2,
+	}, state.TokenUsage.SubagentTokens)
+	require.Nil(t, checkpointUsage.SubagentTokens)
 }
 
 func TestSessionStateBackfillModel_PiReadsModelFromTranscript(t *testing.T) {
@@ -481,13 +628,12 @@ func TestCondenseSession_TagsCheckpointSummaryWithHasInvestigation(t *testing.T)
 	require.NoError(t, os.WriteFile(trackedFile, []byte("agent-modified content"), 0o644))
 
 	require.NoError(t, s.SaveStep(context.Background(), StepContext{
-		SessionID:      sessionID,
-		ModifiedFiles:  []string{"test.txt"},
-		MetadataDir:    metadataDir,
-		MetadataDirAbs: metadataDirAbs,
-		CommitMessage:  "Investigate checkpoint 1",
-		AuthorName:     "Test",
-		AuthorEmail:    "test@test.com",
+		SessionID:     sessionID,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "Investigate checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
 	}))
 
 	state, err := s.loadSessionState(context.Background(), sessionID)
@@ -544,6 +690,205 @@ func TestCondenseSession_TagsCheckpointSummaryWithHasInvestigation(t *testing.T)
 	require.Equal(t, string(session.KindAgentInvestigate), meta.Kind, "per-session Kind")
 	require.Equal(t, "0123456789ab", meta.InvestigateRunID, "per-session InvestigateRunID")
 	require.Equal(t, "Why is checkout flaky?", meta.InvestigateTopic, "per-session InvestigateTopic")
+}
+
+// TestCondenseSession_OutOfBandTokenFallback verifies that for an agent without
+// transcript-embedded token data (Antigravity is not a TokenCalculator), a
+// populated SessionState.TokenUsage flows through to the per-session
+// CommittedMetadata.token_usage on the metadata branch. This is the out-of-band
+// fallback: agy accumulates per-turn deltas into SessionState.TokenUsage at
+// SaveStep time, and the transcript recompute yields nil, so without the
+// fallback the UI would show no token counts.
+//
+// Tests in this file use t.Chdir for CWD-based git resolution, so this
+// cannot be a parallel test.
+func TestCondenseSession_OutOfBandTokenFallback(t *testing.T) {
+	dir := setupGitRepo(t)
+	t.Chdir(dir)
+
+	repo, err := gitrepo.OpenPath(dir)
+	require.NoError(t, err)
+
+	s := &ManualCommitStrategy{}
+	sessionID := "2026-06-03-antigravity-tokens"
+
+	metadataDir := ".entire/metadata/" + sessionID
+	metadataDirAbs := filepath.Join(dir, metadataDir)
+	require.NoError(t, os.MkdirAll(metadataDirAbs, 0o755))
+
+	// Antigravity transcripts carry no token usage, so the condensation
+	// recompute yields nil — exactly the case the fallback handles.
+	transcript := `{"type":"human","message":{"content":"add tokens"}}
+{"type":"assistant","message":{"content":"Done."}}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(metadataDirAbs, paths.TranscriptFileName), []byte(transcript), 0o644))
+
+	trackedFile := filepath.Join(dir, "test.txt")
+	require.NoError(t, os.WriteFile(trackedFile, []byte("agent-modified content"), 0o644))
+
+	require.NoError(t, s.SaveStep(context.Background(), StepContext{
+		SessionID:     sessionID,
+		AgentType:     agent.AgentTypeAntigravity,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "Antigravity checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
+	}))
+
+	state, err := s.loadSessionState(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, agent.AgentTypeAntigravity, state.AgentType, "session must be tagged as Antigravity")
+
+	// Simulate the lifecycle accumulating an out-of-band token delta:
+	// SaveStep accumulates StepContext.TokenUsage into BOTH the
+	// checkpoint-scoped CheckpointTokenUsage (reset at every condensation)
+	// and the session-cumulative TokenUsage (never reset). The checkpoint
+	// metadata must take the checkpoint-scoped value. Make the cumulative
+	// total deliberately LARGER (as after an earlier condensed turn) so this
+	// test fails if condensation ever inherits the cumulative total again —
+	// that bug double-counted earlier turns on every checkpoint after the
+	// first.
+	state.CheckpointTokenUsage = &agent.TokenUsage{
+		InputTokens:         3500,
+		OutputTokens:        300,
+		CacheCreationTokens: 50,
+		CacheReadTokens:     3400,
+		APICallCount:        2,
+	}
+	state.TokenUsage = &agent.TokenUsage{
+		InputTokens:         9999,
+		OutputTokens:        888,
+		CacheCreationTokens: 77,
+		CacheReadTokens:     6666,
+		APICallCount:        5,
+	}
+	require.NoError(t, SaveSessionState(context.Background(), state))
+
+	checkpointID := id.MustCheckpointID("ddee00112233")
+	result, err := s.CondenseSession(context.Background(), repo, checkpointID, state, nil)
+	require.NoError(t, err)
+	require.False(t, result.Skipped, "condensation must not skip when files are touched")
+
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	require.NoError(t, err)
+	commit, err := repo.CommitObject(ref.Hash())
+	require.NoError(t, err)
+	tree, err := commit.Tree()
+	require.NoError(t, err)
+
+	checkpointTree, err := tree.Tree(checkpointID.Path())
+	require.NoError(t, err)
+
+	// Per-session metadata must round-trip the out-of-band token usage.
+	sessionMeta, err := checkpointTree.File(checkpointID.Path() + "/0/" + paths.MetadataFileName)
+	if err != nil {
+		subtree, subErr := checkpointTree.Tree("0")
+		require.NoError(t, subErr)
+		sessionMeta, err = subtree.File(paths.MetadataFileName)
+		require.NoError(t, err)
+	}
+	sessionBytes, err := sessionMeta.Contents()
+	require.NoError(t, err)
+	var meta checkpoint.Metadata
+	require.NoError(t, json.Unmarshal([]byte(sessionBytes), &meta))
+
+	require.NotNil(t, meta.TokenUsage, "per-session token_usage must be populated from the checkpoint-scoped accumulator")
+	require.Equal(t, 3500, meta.TokenUsage.InputTokens, "InputTokens must be the checkpoint-scoped delta, not the session-cumulative total")
+	require.Equal(t, 300, meta.TokenUsage.OutputTokens, "OutputTokens")
+	require.Equal(t, 50, meta.TokenUsage.CacheCreationTokens, "CacheCreationTokens")
+	require.Equal(t, 3400, meta.TokenUsage.CacheReadTokens, "CacheReadTokens")
+	require.Equal(t, 2, meta.TokenUsage.APICallCount, "APICallCount")
+}
+
+// TestCondenseSession_NonOOBAgentDoesNotInheritStateTokens is the negative
+// branch of the token resolution: NO agent may inherit the session-cumulative
+// SessionState.TokenUsage into per-checkpoint metadata (it is never reset at
+// condensation, so it double-counts earlier turns). Checkpoint metadata comes
+// only from the transcript recompute or the checkpoint-scoped
+// state.CheckpointTokenUsage. Cursor with a populated state total and a nil
+// recompute must therefore produce empty checkpoint token_usage.
+//
+// Tests in this file use t.Chdir for CWD-based git resolution, so this
+// cannot be a parallel test.
+func TestCondenseSession_NonOOBAgentDoesNotInheritStateTokens(t *testing.T) {
+	dir := setupGitRepo(t)
+	t.Chdir(dir)
+
+	repo, err := gitrepo.OpenPath(dir)
+	require.NoError(t, err)
+
+	s := &ManualCommitStrategy{}
+	sessionID := "2026-06-03-cursor-tokens"
+
+	metadataDir := ".entire/metadata/" + sessionID
+	metadataDirAbs := filepath.Join(dir, metadataDir)
+	require.NoError(t, os.MkdirAll(metadataDirAbs, 0o755))
+
+	// Token-less transcript: the condensation recompute yields nil TokenUsage,
+	// mirroring the positive test so the only behavioral difference is the
+	// agent's OutOfBandTokenSource capability.
+	transcript := `{"type":"human","message":{"content":"add tokens"}}
+{"type":"assistant","message":{"content":"Done."}}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(metadataDirAbs, paths.TranscriptFileName), []byte(transcript), 0o644))
+
+	trackedFile := filepath.Join(dir, "test.txt")
+	require.NoError(t, os.WriteFile(trackedFile, []byte("agent-modified content"), 0o644))
+
+	require.NoError(t, s.SaveStep(context.Background(), StepContext{
+		SessionID:     sessionID,
+		AgentType:     agent.AgentTypeCursor,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "Cursor checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
+	}))
+
+	state, err := s.loadSessionState(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, agent.AgentTypeCursor, state.AgentType, "session must be tagged as Cursor")
+
+	// Populate SessionState.TokenUsage anyway. A non-OOB agent must NOT inherit
+	// this — the fallback gate excludes it.
+	state.TokenUsage = &agent.TokenUsage{
+		InputTokens:         3500,
+		OutputTokens:        300,
+		CacheCreationTokens: 50,
+		CacheReadTokens:     3400,
+		APICallCount:        2,
+	}
+	require.NoError(t, SaveSessionState(context.Background(), state))
+
+	checkpointID := id.MustCheckpointID("ddee44556677")
+	result, err := s.CondenseSession(context.Background(), repo, checkpointID, state, nil)
+	require.NoError(t, err)
+	require.False(t, result.Skipped, "condensation must not skip when files are touched")
+
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	require.NoError(t, err)
+	commit, err := repo.CommitObject(ref.Hash())
+	require.NoError(t, err)
+	tree, err := commit.Tree()
+	require.NoError(t, err)
+
+	checkpointTree, err := tree.Tree(checkpointID.Path())
+	require.NoError(t, err)
+
+	sessionMeta, err := checkpointTree.File(checkpointID.Path() + "/0/" + paths.MetadataFileName)
+	if err != nil {
+		subtree, subErr := checkpointTree.Tree("0")
+		require.NoError(t, subErr)
+		sessionMeta, err = subtree.File(paths.MetadataFileName)
+		require.NoError(t, err)
+	}
+	sessionBytes, err := sessionMeta.Contents()
+	require.NoError(t, err)
+	var meta checkpoint.Metadata
+	require.NoError(t, json.Unmarshal([]byte(sessionBytes), &meta))
+
+	require.Nil(t, meta.TokenUsage, "non-OOB agent must NOT inherit SessionState.TokenUsage; per-session token_usage must be nil")
 }
 
 func setupEndedSessionWithoutFiles(t *testing.T, s *ManualCommitStrategy, repo *git.Repository, dir, sessionID string) *SessionState {
@@ -735,12 +1080,11 @@ func TestCondenseSessionByID_DoesNotReuseCheckpointAfterSessionAdvances(t *testi
 	advancedTranscript := testTranscriptPromptResponse + `{"type":"human","message":{"content":"another prompt"}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(metadataDirAbs, paths.TranscriptFileName), []byte(advancedTranscript), 0o644))
 	require.NoError(t, s.SaveStep(context.Background(), StepContext{
-		SessionID:      sessionID,
-		MetadataDir:    metadataDir,
-		MetadataDirAbs: metadataDirAbs,
-		CommitMessage:  "Checkpoint 2",
-		AuthorName:     "Test",
-		AuthorEmail:    "test@test.com",
+		SessionID:     sessionID,
+		MetadataDir:   metadataDir,
+		CommitMessage: "Checkpoint 2",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
 	}))
 
 	require.NoError(t, s.CondenseSessionByID(context.Background(), sessionID))
@@ -762,7 +1106,7 @@ func TestCondenseSessionByID_DoesNotReuseCheckpointAfterSessionAdvances(t *testi
 const taskTranscriptSecret = "sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA"
 
 // setupCondensableSessionWithTranscript creates a git repo, writes a session
-// transcript, and runs SaveStep so the session has a shadow branch and passes
+// transcript, and runs SaveStep so the session has a turn-end step and passes
 // CondenseSession's existing no-transcript-no-files skip gate — the fixture
 // shared by the task-record materializer tests below.
 func setupCondensableSessionWithTranscript(t *testing.T, sessionID string) (*git.Repository, *SessionState) {
@@ -787,13 +1131,12 @@ func setupCondensableSessionWithTranscript(t *testing.T, sessionID string) (*git
 	require.NoError(t, os.WriteFile(trackedFile, []byte("agent-modified content"), 0o644))
 
 	require.NoError(t, s.SaveStep(context.Background(), StepContext{
-		SessionID:      sessionID,
-		ModifiedFiles:  []string{"test.txt"},
-		MetadataDir:    metadataDir,
-		MetadataDirAbs: metadataDirAbs,
-		CommitMessage:  "checkpoint 1",
-		AuthorName:     "Test",
-		AuthorEmail:    "test@test.com",
+		SessionID:     sessionID,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
 	}))
 
 	state, err := s.loadSessionState(context.Background(), sessionID)
@@ -886,6 +1229,145 @@ func TestCondenseSession_MaterializesCompletedTaskRecord_RegressionFor2058(t *te
 	// is now durably stored, so it must be removed from session state.
 	resetCheckpointWindow(state)
 	require.Empty(t, state.TaskRecords, "completed task record must be removed after materialization")
+}
+
+func TestCondenseSession_TranscriptUnavailableDoesNotProbeGenericLayout(t *testing.T) {
+	const (
+		sessionID = "2026-09-03-copilot-no-child-transcript"
+		toolUseID = "toolu_copilot_no_transcript"
+		agentID   = "24d8773a-06e8-435c-9257-8ccb89a54f33"
+	)
+	repo, state := setupCondensableSessionWithTranscript(t, sessionID)
+	coincidental := filepath.Join(filepath.Dir(state.TranscriptPath), "agent-"+agentID+".jsonl")
+	require.NoError(t, os.WriteFile(coincidental, []byte(`{"secret":"must not be attributed"}`), 0o600))
+	state.TaskRecords = []session.TaskRecord{{
+		ToolUseID:             toolUseID,
+		AgentID:               agentID,
+		StartedAt:             time.Now(),
+		CompletedAt:           time.Now(),
+		TranscriptUnavailable: true,
+	}}
+	require.NoError(t, SaveSessionState(context.Background(), state))
+
+	checkpointID := id.MustCheckpointID("aabbccddaa09")
+	_, err := (&ManualCommitStrategy{}).CondenseSession(context.Background(), repo, checkpointID, state, nil)
+	require.NoError(t, err)
+	_, found := checkpointTaskFile(t, repo, checkpointID, "tasks/"+toolUseID+"/agent-"+agentID+".jsonl")
+	require.False(t, found)
+	taskJSON, found := checkpointTaskFile(t, repo, checkpointID, "tasks/"+toolUseID+"/task.json")
+	require.True(t, found)
+	require.Contains(t, taskJSON, taskTranscriptReasonUnresolvable)
+}
+
+// TestMaterializeTaskRecords_CodexRecordWithoutPathResolvesThroughInventory
+// covers a Codex parent that commits mid-turn, after its child finished but
+// before the parent's Stop refreshed the inventory: the task record has no
+// declared path, and the Claude-layout fallback cannot find a Codex rollout.
+// Condensation must resolve the rollout by session_meta.id through the
+// inventory instead of storing a reason-only task.json, and must still refuse
+// a rollout whose session_meta.id names a different agent.
+func TestMaterializeTaskRecords_CodexRecordWithoutPathResolvesThroughInventory(t *testing.T) {
+	const agentID = "01a1024d-83c0-78f2-9d06-1d122de7dab4"
+	tests := []struct {
+		name           string
+		rolloutID      string
+		wantTranscript bool
+	}{
+		{name: "matching session_meta id", rolloutID: agentID, wantTranscript: true},
+		{name: "mismatched session_meta id", rolloutID: "01a1024d-0000-0000-0000-000000000000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, state := setupCondensableSessionWithTranscript(t, "2026-10-03-codex-mid-turn-"+tt.rolloutID)
+
+			sessions := t.TempDir()
+			rollout := filepath.Join(sessions, "2026", "10", "03", "rollout-2026-10-03T17-06-36-"+tt.rolloutID+".jsonl")
+			writeCodexRolloutFixture(t, rollout, tt.rolloutID)
+
+			// The shape RecordSubagentStop leaves behind before any refresh:
+			// an inventory entry and an in-flight record, neither with a path.
+			state.SubagentInventory = []session.SubagentInventoryEntry{{AgentID: agentID, ObservedTurnIDs: []string{"turn-1"}}}
+			state.TaskRecords = []session.TaskRecord{{ToolUseID: agentID, AgentID: agentID}}
+
+			ag := &codex.CodexAgent{RolloutRoots: []string{sessions}}
+			payloads, _ := (&ManualCommitStrategy{}).materializeTaskRecords(context.Background(), context.Background(), ag, state, nil)
+			require.Len(t, payloads, 1)
+			if !tt.wantTranscript {
+				require.Equal(t, taskTranscriptReasonUnresolvable, payloads[0].TranscriptUnavailableReason)
+				require.Empty(t, payloads[0].Transcript.Bytes())
+				return
+			}
+			require.Empty(t, payloads[0].TranscriptUnavailableReason)
+			require.Contains(t, string(payloads[0].Transcript.Bytes()), "added count")
+		})
+	}
+}
+
+// TestMaterializeTaskRecords_CodexRelocatedRolloutResolvesThroughInventory
+// covers a declared path that went stale: Codex archived the rollout after the
+// turn-end refresh recorded its path on the task record. The declared path no
+// longer exists and the Claude-layout fallback cannot find a Codex rollout, so
+// condensation must re-resolve it by session_meta.id through the inventory.
+func TestMaterializeTaskRecords_CodexRelocatedRolloutResolvesThroughInventory(t *testing.T) {
+	const agentID = "01a1024d-83c0-78f2-9d06-1d122de7dab4"
+	_, state := setupCondensableSessionWithTranscript(t, "2026-10-03-codex-relocated-rollout")
+
+	root := t.TempDir()
+	name := filepath.Join("2026", "10", "03", "rollout-2026-10-03T17-06-36-"+agentID+".jsonl")
+	stale := filepath.Join(root, "sessions", name)
+	archived := filepath.Join(root, "archived_sessions", name)
+	writeCodexRolloutFixture(t, archived, agentID)
+
+	state.SubagentInventory = []session.SubagentInventoryEntry{{AgentID: agentID, ObservedTurnIDs: []string{"turn-1"}, ResolvedTranscriptPath: stale}}
+	state.TaskRecords = []session.TaskRecord{{ToolUseID: agentID, AgentID: agentID, DeclaredTranscriptPath: stale, CompletedAt: time.Now()}}
+
+	ag := &codex.CodexAgent{RolloutRoots: []string{filepath.Join(root, "sessions"), filepath.Join(root, "archived_sessions")}}
+	payloads, _ := (&ManualCommitStrategy{}).materializeTaskRecords(context.Background(), context.Background(), ag, state, nil)
+	require.Len(t, payloads, 1)
+	require.Empty(t, payloads[0].TranscriptUnavailableReason)
+	require.Contains(t, string(payloads[0].Transcript.Bytes()), "added count")
+}
+
+// TestMaterializeTaskRecords_CodexUnreadableDeclaredPathResolvesThroughInventory
+// covers a declared path that exists but cannot be opened: an existence check
+// alone would keep it off the inventory resolver, and reading it then fails.
+// The declared file sits outside the rollout roots, because an unreadable file
+// inside them makes the Codex scan fail closed by design.
+func TestMaterializeTaskRecords_CodexUnreadableDeclaredPathResolvesThroughInventory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this test removes")
+	}
+	if runtime.GOOS == goosWindows {
+		t.Skip("unix permission bits")
+	}
+	const agentID = "01a1024d-83c0-78f2-9d06-1d122de7dab4"
+	_, state := setupCondensableSessionWithTranscript(t, "2026-10-03-codex-unreadable-declared")
+
+	root := t.TempDir()
+	declared := filepath.Join(root, "declared", "rollout.jsonl")
+	writeCodexRolloutFixture(t, declared, agentID)
+	require.NoError(t, os.Chmod(declared, 0o000))
+	sessions := filepath.Join(root, "sessions")
+	writeCodexRolloutFixture(t, filepath.Join(sessions, "2026", "10", "03", "rollout-"+agentID+".jsonl"), agentID)
+
+	state.SubagentInventory = []session.SubagentInventoryEntry{{AgentID: agentID, ObservedTurnIDs: []string{"turn-1"}, DeclaredTranscriptPath: declared}}
+	state.TaskRecords = []session.TaskRecord{{ToolUseID: agentID, AgentID: agentID, DeclaredTranscriptPath: declared, CompletedAt: time.Now()}}
+
+	ag := &codex.CodexAgent{RolloutRoots: []string{sessions}}
+	payloads, _ := (&ManualCommitStrategy{}).materializeTaskRecords(context.Background(), context.Background(), ag, state, nil)
+	require.Len(t, payloads, 1)
+	require.Empty(t, payloads[0].TranscriptUnavailableReason)
+	require.Contains(t, string(payloads[0].Transcript.Bytes()), "added count")
+}
+
+// writeCodexRolloutFixture writes a minimal Codex rollout whose session_meta.id
+// is id, with one assistant message reading "added count".
+func writeCodexRolloutFixture(t *testing.T, path, id string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"type":"session_meta","payload":{"id":"`+id+`"}}`+"\n"+
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"added count"}]}}`+"\n"), 0o600))
 }
 
 // TestCondenseSession_InFlightTaskRecord_TranscriptSoFarStoredRecordSurvives
@@ -1022,7 +1504,7 @@ func TestCondenseSession_TaskRecordMissingTranscriptPath_RecordsUnavailableReaso
 
 // TestCondenseSession_PoisonedTaskRecord_SkippedNotWedged is the regression
 // for the "poisoned record must not wedge condensation forever" hardening: a
-// record with an unsafe ToolUseID must not abort the whole checkpoint write
+// record with an unsafe ToolUseID or AgentID must not abort the whole checkpoint write
 // (which would re-fail on every future condensation, since completed records
 // are only removed after a successful write), nor should it silently produce
 // a task.json it can't safely be placed under. Alongside a valid record, the
@@ -1046,6 +1528,13 @@ func TestCondenseSession_PoisonedTaskRecord_SkippedNotWedged(t *testing.T) {
 			AgentID:                "agent-poison",
 			DeclaredTranscriptPath: validTranscriptPath,
 			CompletedAt:            completedAt,
+		},
+		{
+			// Path-unsafe even when the agent reports that no transcript exists.
+			ToolUseID:             "toolu_poisoned_agent",
+			AgentID:               "../escape",
+			TranscriptUnavailable: true,
+			CompletedAt:           completedAt,
 		},
 		{
 			ToolUseID:              "toolu_valid",
@@ -1089,12 +1578,14 @@ func TestCondenseSession_PoisonedTaskRecord_SkippedNotWedged(t *testing.T) {
 	}
 	require.False(t, remaining["../escape"],
 		"a completed poisoned record can never materialize, so it must still be removed rather than retried forever")
+	require.False(t, remaining["toolu_poisoned_agent"],
+		"a completed record with a poisoned agent ID must be removed rather than retried forever")
 	require.False(t, remaining["toolu_valid"], "the completed valid record was materialized and must also be removed")
 }
 
 // TestCondenseAndMarkFullyCondensed_RecordsOnlySessionMaterializes is the
 // trigger half of invariant 7: a records-only session (read-only background
-// subagent; no SaveStep, no shadow branch, no files, no parent transcript)
+// subagent; no SaveStep, no files, no parent transcript)
 // must condense into a real checkpoint carrying tasks/<id>/. FullyCondensed is
 // already true here because the task may complete after SessionEnd condensed
 // the earlier state; the new task content must make the session eligible again.
@@ -1190,99 +1681,122 @@ func TestCheckpointStepCount(t *testing.T) {
 	}
 }
 
-// TestCondenseSession_TaskRecordImageExternalizationBoundary verifies the fix
-// for #2063: a task transcript whose RAW size (including base64 images) exceeds
-// the cap, but whose EXTERNALIZED size is within the cap, must be stored
-// successfully.
-func TestCondenseSession_TaskRecordImageExternalizationBoundary(t *testing.T) {
-	sessionID := "2026-08-23-task-image-boundary"
-	repo, state := setupCondensableSessionWithTranscript(t, sessionID)
-	// Enable image externalization for the test via env.
-	t.Setenv("ENTIRE_EXTERNALIZE_IMAGES", "1")
-	state.AgentType = agent.AgentTypeClaudeCode
+// TestClearFilesystemStagedFiles_ReleasesAllStagedFiles pins the leak fix: the
+// staged files are a buffer for the checkpoint writer, so once a session's work
+// is condensed they must not stay in the worktree. Before this, nothing ever
+// removed the transcript and a few hundred sessions accumulated hundreds of MB.
+//
+// Not parallel: entiredir resolves the worktree root from the process CWD.
+func TestClearFilesystemStagedFiles_ReleasesAllStagedFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.WriteFile(t, repoDir, "f.txt", "init")
+	testutil.GitAdd(t, repoDir, "f.txt")
+	testutil.GitCommit(t, repoDir, "init")
+	t.Chdir(repoDir)
+
+	const sessionID = "session-clear-staged"
+	metaDir := filepath.Join(repoDir, paths.SessionMetadataDirFromSessionID(sessionID))
+	require.NoError(t, os.MkdirAll(metaDir, 0o750))
+
+	// A file that is not staged metadata, to pin that the release is scoped to
+	// the known names rather than emptying the directory.
+	keep := filepath.Join(metaDir, "content_hash.txt")
+	staged := make([]string, 0, len(stagedSessionFiles))
+	for _, name := range stagedSessionFiles {
+		staged = append(staged, filepath.Join(metaDir, name))
+	}
+	for _, p := range append(append([]string{}, staged...), keep) {
+		require.NoError(t, os.WriteFile(p, []byte(`{"x":1}`+"\n"), 0o600))
+	}
+
+	releaseStoredCopyForTest(context.Background(), sessionID)
+
+	for _, p := range staged {
+		assert.NoFileExists(t, p, "%s should be released after condensation", filepath.Base(p))
+	}
+	assert.FileExists(t, keep, "a non-staged file must not be swept up")
+	assert.DirExists(t, metaDir, "the session metadata directory must survive")
+}
+
+// TestClearFilesystemStagedFiles_MissingFilesAreNotAnError covers the ordinary
+// steady state after the first condensation: the files are already gone, and a
+// later commit for the same session must not fail or panic. The legacy full.log
+// name is absent on every session this CLI captured, so that path is the norm.
+func TestClearFilesystemStagedFiles_MissingFilesAreNotAnError(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.WriteFile(t, repoDir, "f.txt", "init")
+	testutil.GitAdd(t, repoDir, "f.txt")
+	testutil.GitCommit(t, repoDir, "init")
+	t.Chdir(repoDir)
+
+	// No metadata directory at all, then an empty one.
+	releaseStoredCopyForTest(context.Background(), "session-never-staged")
+
+	metaDir := filepath.Join(repoDir, paths.SessionMetadataDirFromSessionID("session-empty"))
+	require.NoError(t, os.MkdirAll(metaDir, 0o750))
+	releaseStoredCopyForTest(context.Background(), "session-empty")
+	assert.DirExists(t, metaDir)
+}
+
+// A commit-less condense (doctor, the sweep) writes a checkpoint no commit
+// will carry, so the files it recorded can never be linked by a later commit.
+// It must leave nothing pending: no files, no hashes, no next-checkpoint
+// preview for the session.
+func TestCondenseSessionByID_ClearsPendingFiles(t *testing.T) { //nolint:paralleltest // uses t.Chdir
+	dir := setupGitRepo(t)
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+
+	s := &ManualCommitStrategy{}
+	sessionID := "commitless-condense-clears-files"
+	metadataDir := paths.SessionMetadataDirFromSessionID(sessionID)
+	testutil.WriteFile(t, dir, filepath.Join(metadataDir, paths.TranscriptFileName), testTranscriptPromptResponse)
+	testutil.WriteFile(t, dir, "test.txt", "agent content")
+	require.NoError(t, s.SaveStep(t.Context(), StepContext{
+		SessionID:     sessionID,
+		ModifiedFiles: []string{"test.txt"},
+		MetadataDir:   metadataDir,
+		CommitMessage: "Checkpoint 1",
+		AuthorName:    "Test",
+		AuthorEmail:   "test@test.com",
+		AgentType:     agent.AgentTypeClaudeCode,
+	}))
+
+	previews, err := s.PreviewNextCheckpoint(t.Context())
+	require.NoError(t, err)
+	require.Len(t, previews, 1, "fixture: the session is pending before the condense")
+
+	require.NoError(t, s.CondenseSessionByID(t.Context(), sessionID))
+
+	state, err := s.loadSessionState(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	require.Empty(t, state.FilesTouched)
+	require.Empty(t, state.TouchedFileHashes)
+	require.False(t, state.HasPendingWork())
+
+	previews, err = s.PreviewNextCheckpoint(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, previews, "checkpoint list --pending must no longer preview a condensed session")
+}
+
+// TestResolveTaskTranscriptPath_FindsWorkflowRunTranscript: a Workflow agent's
+// task record whose declared path was lost still resolves to its transcript
+// under <subagents>/workflows/<runId>/ (#2685), the layout
+// cli.ResolveAgentTranscriptPath also probes.
+func TestResolveTaskTranscriptPath_FindsWorkflowRunTranscript(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
-	agentTranscriptPath := filepath.Join(dir, "agent-transcript.jsonl")
+	const sessionID = "parent-sess"
+	want := filepath.Join(paths.SubagentsDir(dir, sessionID), "workflows", "wf_1", "agent-ae3d7b8f2930c8787.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(want), 0o750))
+	require.NoError(t, os.WriteFile(want, []byte("{}\n"), 0o600))
+	state := &SessionState{SessionID: sessionID, TranscriptPath: filepath.Join(dir, sessionID+".jsonl")}
 
-	// Helper to write a transcript with a base64 image of specified decoded size.
-	writeImageTranscript := func(path string, decodedSize int) {
-		f, err := os.Create(path)
-		require.NoError(t, err)
-		defer f.Close()
-
-		_, err = f.WriteString(`{"role":"assistant","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`)
-		require.NoError(t, err)
-
-		// Stream base64 to avoid huge memory allocations.
-		// 3 bytes -> 4 base64 chars.
-		buf := make([]byte, 3072) // multiple of 3
-		for i := 0; i < decodedSize; i += len(buf) {
-			n := len(buf)
-			if i+n > decodedSize {
-				n = decodedSize - i
-			}
-			for j := 0; j < n; j++ {
-				buf[j] = byte((i + j) % 256)
-			}
-			_, err = f.WriteString(base64.StdEncoding.EncodeToString(buf[:n]))
-			require.NoError(t, err)
-		}
-
-		_, err = f.WriteString(`"}}],"message":{"id":"msg_123"}}` + "\n")
-		require.NoError(t, err)
-	}
-
-	// Use small test boundaries to avoid huge disk writes.
-	// We use the imageextract package's internal variable.
-	// Since we are in the strategy package, we need to export it or use the real cap.
-	// Given the constraints, we will stick to the real 40MiB size for the primary test
-	// but add a comment explaining why we aren't using a smaller mock.
-	//
-	// Note: Case 1 already uses 40MiB which is > 32MiB (approx base64 for 50MiB)
-	// but < 50MiB. Actually, 40MiB decoded -> 53.3MiB base64, which is > 50MiB cap.
-	// The goal is to prove that after externalization (placeholder only), it's < 50MiB.
-
-	// Case 1: 40 MiB decoded -> ~53.3 MiB base64.
-	// This exceeds agent.MaxChunkSize (50 MiB) in raw form.
-	// After externalization, the transcript will only contain a placeholder.
-	writeImageTranscript(agentTranscriptPath, 40*1024*1024)
-
-	state.TaskRecords = []session.TaskRecord{
-		{
-			ToolUseID:              "toolu_boundary",
-			AgentID:                "agent-boundary",
-			DeclaredTranscriptPath: agentTranscriptPath,
-			CompletedAt:            time.Now(),
-		},
-	}
-	require.NoError(t, SaveSessionState(context.Background(), state))
-	checkpointID := id.MustCheckpointID("aabbccdd2063")
-	result, err := (&ManualCommitStrategy{}).CondenseSession(context.Background(), repo, checkpointID, state, nil)
-	require.NoError(t, err)
-	require.False(t, result.Skipped)
-
-	// Verify the transcript was stored.
-	jsonl, ok := checkpointTaskFile(t, repo, checkpointID, "tasks/toolu_boundary/agent-agent-boundary.jsonl")
-	require.True(t, ok, "transcript must be stored because externalized size is under cap")
-	require.Contains(t, jsonl, "entire-asset:assets/", "transcript must contain the asset placeholder")
-	require.Less(t, len(jsonl), 1024, "transcript must be shrunken")
-
-	// Case 2: Image that is NOT externalized and hits the 50MiB cap.
-	// Since we can't easily mock agent.MaxChunkSize (it's a const),
-	// we use a 51MiB image. Because it's > 50MiB DECODED, it stays inline
-	// and then prepareTaskTranscriptForStorage hits the MaxChunkSize cap.
-	writeImageTranscript(agentTranscriptPath, 51*1024*1024)
-
-	state.TaskRecords[0].ToolUseID = "toolu_oversize"
-	checkpointID2 := id.MustCheckpointID("aabbccdd2064")
-	_, err = (&ManualCommitStrategy{}).CondenseSession(context.Background(), repo, checkpointID2, state, nil)
-	require.NoError(t, err)
-
-	taskJSON, ok := checkpointTaskFile(t, repo, checkpointID2, "tasks/toolu_oversize/task.json")
-	require.True(t, ok)
-	var meta struct {
-		TranscriptUnavailableReason string `json:"transcript_unavailable_reason"`
-	}
-	require.NoError(t, json.Unmarshal([]byte(taskJSON), &meta))
-	require.Equal(t, taskTranscriptReasonTooLarge, meta.TranscriptUnavailableReason,
-		"transcript with >50MiB decoded image must hit the cap")
+	assert.Equal(t, want, resolveTaskTranscriptPath(state, "ae3d7b8f2930c8787"))
+	assert.Empty(t, resolveTaskTranscriptPath(state, "other"))
 }

@@ -14,11 +14,12 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/auth"
 	"github.com/entireio/cli/cmd/entire/cli/codesearch"
+	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/search"
-	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/cmd/entire/cli/telemetry"
 	"github.com/entireio/cli/internal/coreapi"
 	"github.com/spf13/cobra"
 )
@@ -58,9 +59,12 @@ snippet, and a truncated title instead of the full prompt (repo hits add
 description and checkpoint count). Fetch full detail
 for a single result with 'entire checkpoint explain <id>', or add --full to
 that command to pull the checkpoint's entire session transcript. For a
-checkpoint hit from another GitHub repo, add --repo <owner/name> to
-'entire checkpoint explain' (requires the full checkpoint ID; unrelated to
-this command's --repo filter below).
+checkpoint or commit hit from another repo, add --repo gh/<owner>/<repo> for
+a GitHub mirror or --repo et/<project>/<repo> for an Entire-native repo. The
+forge prefix is required, and the hit's id must be ` + explainRepoTargetShapes + `
+(a SHA is resolved to its checkpoint by that repo's Entire API). Prefixes
+cannot be resolved in another repo. This is unrelated to this command's
+--repo filter below.
 
 CLI queries also support inline filters like author:<name>, date:<week|month>,
 branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
@@ -143,6 +147,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 					caseSensitive: caseSensitive,
 					jsonOutput:    jsonOutput,
 					insecureHTTP:  insecureHTTPAuth,
+					commandPath:   cmd.CommandPath(),
 				})
 			}
 
@@ -187,35 +192,23 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 				return errors.New("query required when using --json, accessible mode, or piped output. Usage: entire search <query>")
 			}
 
-			// Get the repo's GitHub remote URL
-			repo, err := strategy.OpenRepository(ctx)
+			// Default scope is the current repo, named with its forge like the
+			// --code path, so an Entire-native clone (et/) searches as itself.
+			// With an explicit scope the origin is not needed at all.
+			forge, owner, repoName, err := resolveDefaultSearchRepo(ctx, allRepos || len(filterRepoWildcards(repos)) > 0)
 			if err != nil {
-				cmd.SilenceUsage = true
-				fmt.Fprintln(cmd.ErrOrStderr(), "Not a git repository. Run this command from within a git repository.")
-				return NewSilentError(err)
-			}
-			defer repo.Close()
-
-			remote, err := repo.Remote("origin")
-			if err != nil {
-				return fmt.Errorf("could not find 'origin' remote: %w", err)
-			}
-			urls := remote.Config().URLs
-			if len(urls) == 0 {
-				return errors.New("origin remote has no URLs configured")
-			}
-
-			owner, repoName, err := search.ParseGitHubRemote(urls[0])
-			if err != nil {
-				return fmt.Errorf("parsing remote URL: %w", err)
+				return err
 			}
 
 			// Semantic search goes to the v4 query-serve path (entire-api
 			// cell gateway) via newSemanticSearcher, which fans out across
-			// cells and mints per-cell identity tokens itself (ENT-1055).
-			searcher := newSemanticSearcher(insecureHTTPAuth)
+			// cells with the login JWT as bearer (ENT-1055).
+			// Instrumented at the seam so the TUI's re-searches and
+			// pagination emit outcome telemetry too, not just this one-shot.
+			searcher := instrumentSemanticSearcher(cmd.CommandPath(), newSemanticSearcher(insecureHTTPAuth))
 
 			searchCfg := search.Config{
+				Forge:    forge,
 				Owner:    owner,
 				Repo:     repoName,
 				Repos:    repos,
@@ -237,7 +230,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 			if query == "" && !searchCfg.HasFilters() {
 				searchCfg.Limit = search.DefaultLimit
 				styles := newStatusStyles(w)
-				model := newSearchModel(nil, "", 0, searchCfg, styles, buildCodeSearchOpts(ctx, owner, repoName, nil, false, insecureHTTPAuth))
+				model := newSearchModel(nil, "", 0, searchCfg, styles, buildCodeSearchOpts(ctx, cmd.CommandPath(), owner, repoName, nil, false, insecureHTTPAuth))
 				model.semanticSearch = searcher
 				model.mode = modeSearch
 				model.input.Focus()
@@ -286,7 +279,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 			}
 
 			// Interactive TUI
-			codeOpts := buildCodeSearchOpts(ctx, owner, repoName, repos, allRepos, insecureHTTPAuth)
+			codeOpts := buildCodeSearchOpts(ctx, cmd.CommandPath(), owner, repoName, repos, allRepos, insecureHTTPAuth)
 			if codeOpts != nil {
 				// Use extractInlineRepoFilters on the raw query so author:/date:/branch:
 				// tokens are preserved as literal code-search text, matching --code and
@@ -339,26 +332,42 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 	return cmd
 }
 
+// resolveDefaultSearchRepo derives the current repo's forge-qualified
+// coordinates from the origin remote for the default (current-repo) scope,
+// mirroring the --code path: native (et/) and GitHub (gh/) repos keep their
+// forge so same-named repos across forges cannot be conflated. When the
+// caller supplied an explicit scope (--repo, repo:, --all-repos), an
+// unreadable origin is not an error — the search does not need the current
+// repo — and empty coordinates are returned.
+func resolveDefaultSearchRepo(ctx context.Context, explicitScope bool) (forge, owner, repo string, err error) {
+	forge, owner, repo, err = gitremote.ResolveRemoteRepo(ctx, "origin")
+	if err == nil && (owner == "" || repo == "") {
+		err = errors.New("origin remote names no owner/repo")
+	}
+	if err != nil {
+		if explicitScope {
+			return "", "", "", nil
+		}
+		return "", "", "", fmt.Errorf("could not determine current repository for search (use --repo or --all-repos): %w", err)
+	}
+	return forge, owner, repo, nil
+}
+
 // completeRepoFlag returns shell-completion suggestions for the search
 // command's --repo flag. "*" is always offered so the wildcard works
 // regardless of auth state. Errors are swallowed (rather than surfaced via
 // ShellCompDirectiveError) because completion runs on every TAB press and
 // must never pollute the user's prompt with error output.
-func completeRepoFlag(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+func completeRepoFlag(cmd *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	suggestions := []string{"*"}
-	client, err := NewAuthenticatedAPIClient(cmd.Context(), false)
+	repos, err := listCompletionRepoIndex(cmd.Context(), toComplete)
 	if err != nil {
 		return suggestions, cobra.ShellCompDirectiveNoFileComp
 	}
-	repos, err := client.ListRepositories(cmd.Context(), api.RepositorySortRecent)
-	if err != nil {
-		return suggestions, cobra.ShellCompDirectiveNoFileComp
-	}
-	for _, r := range repos {
-		if r.CheckpointCount == 0 {
-			continue // searching a repo with no checkpoints would always be empty
+	for _, slug := range checkpointRepoSlugs(repos) {
+		if strings.HasPrefix(strings.ToLower(slug), strings.ToLower(toComplete)) {
+			suggestions = append(suggestions, slug)
 		}
-		suggestions = append(suggestions, r.FullName)
 	}
 	return suggestions, cobra.ShellCompDirectiveNoFileComp
 }
@@ -372,6 +381,10 @@ type codeSearchOpts struct {
 	caseSensitive   bool
 	jsonOutput      bool
 	insecureHTTP    bool
+	// commandPath is the invoking cobra command path, carried here because
+	// searchAllCells emits outcome telemetry and the TUI's code tab calls it
+	// long after the command layer returns.
+	commandPath string
 }
 
 // extractInlineRepoFilters extracts only repo: prefixed filters from a query
@@ -423,7 +436,7 @@ func filterRepoWildcards(repos []string) []string {
 // buildCodeSearchOpts returns a *codeSearchOpts pre-populated with repo filters.
 // It honors --repo, --all-repos, and inline repo: filters from the command line;
 // when none are specified, it falls back to the current git origin slug.
-func buildCodeSearchOpts(ctx context.Context, owner, repoName string, repos []string, allRepos, insecureHTTP bool) *codeSearchOpts {
+func buildCodeSearchOpts(ctx context.Context, commandPath, owner, repoName string, repos []string, allRepos, insecureHTTP bool) *codeSearchOpts {
 	var repoFilters []string
 	switch {
 	case allRepos:
@@ -444,10 +457,11 @@ func buildCodeSearchOpts(ctx context.Context, owner, repoName string, repos []st
 		repoFilters:  repoFilters,
 		limit:        search.DefaultLimit,
 		insecureHTTP: insecureHTTP,
+		commandPath:  commandPath,
 	}
 }
 
-// codeSearchCellTimeout bounds each per-cell search call (token exchange + API).
+// codeSearchCellTimeout bounds each per-cell search call (login refresh + API).
 const codeSearchCellTimeout = 30 * time.Second
 
 // runCodeSearch handles the --code flag path: search code content via peregrine.
@@ -473,6 +487,8 @@ func runCodeSearch(ctx context.Context, cmd *cobra.Command, opts codeSearchOpts)
 
 	// Always fan out via searchAllCells — it fetches the repo index,
 	// resolves slugs to ULIDs, and handles single- vs multi-jurisdiction.
+	// searchAllCells emits the outcome telemetry itself, so the TUI's code
+	// tab (which calls it directly) is covered too.
 	resp, err := searchAllCells(ctx, opts)
 	if err != nil {
 		return err
@@ -493,7 +509,22 @@ func runCodeSearch(ctx context.Context, cmd *cobra.Command, opts codeSearchOpts)
 //  3. Group by cell and resolve baseURLs via the shared helpers
 //  4. Fan out via fanOutCells with per-cell codesearch.Search calls
 //  5. Merge results (sorted by score, capped to limit)
-func searchAllCells(ctx context.Context, opts codeSearchOpts) (*codesearch.SearchResponse, error) {
+//
+// Every call emits one cli_search_completed outcome — this is the code-search
+// seam shared by the one-shot --code path and the TUI's code tab, so
+// instrumenting here covers both by construction.
+func searchAllCells(ctx context.Context, opts codeSearchOpts) (resp *codesearch.SearchResponse, err error) {
+	start := time.Now()
+	defer func() {
+		var result searchOutcomeResult
+		if resp != nil {
+			result = searchOutcomeResult{
+				count:              len(resp.Results),
+				coverageIncomplete: len(resp.FailedJurisdictions) > 0 || len(resp.SkippedRepos) > 0,
+			}
+		}
+		emitSearchOutcome(ctx, opts.commandPath, telemetry.SearchModeCode, result, time.Since(start), err)
+	}()
 	// Step 1: Get repos index from the control plane. *coreapi.Client
 	// satisfies cellCoreClient (passed to resolveCellBaseURLs below as such).
 	coreClient, err := coreapi.New()
@@ -587,45 +618,52 @@ func searchAllCells(ctx context.Context, opts codeSearchOpts) (*codesearch.Searc
 // returning the ULID list for peregrine and the subset of index entries whose
 // repos matched (for cell grouping).
 //
-// Matching mirrors the BFF (code-search.ts lines 315-319):
-//
-//	slug = filter starts with "gh/" ? strip prefix : filter unchanged
-//	match = id === filter || full_name === slug || full_name === filter
-//
-// Accepted filter formats:
-//   - ULID            — matched directly on repo ID (raw filter)
-//   - gh/owner/repo   — GitHub repo, stripped to owner/repo for FullName match
-//   - owner/repo      — bare slug, matched on FullName directly
+// IDs match directly; bare names match FullName. Forge-qualified names match
+// the same provider-aware slugs offered by completion, never another forge.
+// Old index entries with no forge signal retain their legacy GitHub spelling
+// (or their explicit three-component forge prefix).
 func resolveRepoFilters(filters []string, repos []coreapi.RepoIndexEntry) (repoIDs []string, matched []coreapi.RepoIndexEntry) {
-	byName := make(map[string]coreapi.RepoIndexEntry, len(repos))
+	byName := make(map[string][]coreapi.RepoIndexEntry, len(repos))
+	bySlug := make(map[string][]coreapi.RepoIndexEntry, len(repos))
 	byID := make(map[string]coreapi.RepoIndexEntry, len(repos))
 	for _, r := range repos {
-		byName[strings.ToLower(r.FullName)] = r
+		name := strings.ToLower(strings.Trim(strings.TrimSpace(r.FullName), "/"))
+		byName[name] = append(byName[name], r)
 		byID[r.ID] = r
+		slug := checkpointRepoSlug(r)
+		if forge, _ := forgeOfEntry(r); forge == "" && !r.Provider.IsSet() {
+			// Legacy rows omit provider and placements; their names were
+			// bare GitHub names or explicitly forge-qualified native names.
+			if strings.Count(name, "/") == 2 && (strings.HasPrefix(name, "gh/") || strings.HasPrefix(name, "et/")) {
+				slug = name
+			} else if strings.Count(name, "/") == 1 {
+				slug = "gh/" + name
+			}
+		}
+		if slug != "" {
+			key := strings.ToLower(slug)
+			bySlug[key] = append(bySlug[key], r)
+		}
 	}
 	seen := make(map[string]bool) // dedup by ID
 	for _, f := range filters {
-		// BFF only strips gh/ prefix; other prefixes are left as-is.
-		slug := f
-		if strings.HasPrefix(f, "gh/") {
-			slug = f[3:]
+		filter := strings.TrimSpace(f)
+		name := strings.ToLower(strings.Trim(filter, "/"))
+		qualified := strings.Count(name, "/") == 2 && (strings.HasPrefix(name, "gh/") || strings.HasPrefix(name, "et/"))
+		var candidates []coreapi.RepoIndexEntry
+		if r, ok := byID[filter]; ok {
+			candidates = []coreapi.RepoIndexEntry{r}
+		} else if qualified {
+			candidates = bySlug[name]
+		} else {
+			candidates = byName[name]
 		}
-
-		// Match order mirrors the BFF: id === filter || full_name === slug || full_name === filter
-		// FullName comparison is case-insensitive so casing differences between
-		// the git remote (e.g. entireio/CLI) and the repo index (entireio/cli)
-		// don't cause a "no matching repositories found" failure.
-		var r coreapi.RepoIndexEntry
-		var ok bool
-		if r, ok = byID[f]; !ok {
-			if r, ok = byName[strings.ToLower(slug)]; !ok {
-				r, ok = byName[strings.ToLower(f)]
+		for _, r := range candidates {
+			if !seen[r.ID] {
+				repoIDs = append(repoIDs, r.ID)
+				matched = append(matched, r)
+				seen[r.ID] = true
 			}
-		}
-		if ok && !seen[r.ID] {
-			repoIDs = append(repoIDs, r.ID)
-			matched = append(matched, r)
-			seen[r.ID] = true
 		}
 	}
 	return repoIDs, matched
@@ -1047,10 +1085,11 @@ type compactSearchHit struct {
 	Date         string   `json:"date,omitempty"`
 	Title        string   `json:"title"`
 	FilesTouched []string `json:"filesTouched,omitempty"`
-	// Description and CheckpointCount only appear on repo rows — without them
-	// a repo hit is just {id, repo, title, score}, too thin for the skill's
-	// "summarize from the compact fields alone" instruction.
-	Description     string  `json:"description,omitempty"`
+	// CheckpointCount only appears on repo rows — without it a repo hit is
+	// just {id, repo, title, score}, too thin for the skill's "summarize from
+	// the compact fields alone" instruction. The repo description is not
+	// carried: its only source was the retired MySQL repos table, so the v1
+	// wire keeps the key but it is always null (ENT-1912, entire-search#198).
 	CheckpointCount int     `json:"checkpointCount,omitempty"`
 	Score           float64 `json:"score"`
 	// Snippet is the matched text (the title is just the commit subject or
@@ -1100,7 +1139,6 @@ func writeSearchCompactJSON(w io.Writer, resp *search.Response, limit, page int)
 			Author:          r.ResultAuthor(),
 			Date:            r.ResultCreatedAt(),
 			Title:           title,
-			Description:     r.ResultDescription(),
 			CheckpointCount: r.ResultCheckpointCount(),
 			Score:           r.Meta.Score,
 			Snippet:         compactSnippet(title, truncateOneLine(r.Meta.Snippet, compactTitleMaxLen)),

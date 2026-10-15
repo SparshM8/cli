@@ -47,7 +47,7 @@ func TestResolveTrailBySelector_FindsBySelector(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			found, err := resolveTrailBySelector(context.Background(), client, "gh", "acme", "repo", tc.selector, "")
+			found, err := resolveTrailBySelectorAtPath(context.Background(), client, trailTestBasePath, "gh", "acme", "repo", tc.selector, "")
 			if err != nil {
 				t.Fatalf("resolveTrailBySelector: %v", err)
 			}
@@ -69,7 +69,7 @@ func TestResolveTrailBySelector_NotFoundIsAnError(t *testing.T) {
 	defer srv.Close()
 
 	client := api.NewClientWithBaseURL("tok", srv.URL)
-	found, err := resolveTrailBySelector(context.Background(), client, "gh", "acme", "repo", "does-not-exist", "")
+	found, err := resolveTrailBySelectorAtPath(context.Background(), client, trailTestBasePath, "gh", "acme", "repo", "does-not-exist", "")
 	if err == nil {
 		t.Fatalf("expected error for missing trail, got found = %#v", found)
 	}
@@ -94,6 +94,8 @@ func TestDescribeTrailRef(t *testing.T) {
 		{"title without number", api.TrailResource{Title: "Add foo"}, `trail "Add foo"`},
 		{"neither", api.TrailResource{}, "trail"},
 		{"title trimmed", api.TrailResource{Number: 1, Title: "  Add foo  "}, "trail #1 (Add foo)"},
+		{"project branch", api.TrailResource{Number: 7, Branch: "feature/x", Parent: &api.TrailParentReference{Number: 42}}, "trail #42 (branch feature/x)"},
+		{"project merged branch", api.TrailResource{Number: 7, OriginalBranch: "feature/old", Parent: &api.TrailParentReference{Number: 42}}, "trail #42 (branch feature/old)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,7 +114,7 @@ func TestDescribeTrailRef(t *testing.T) {
 func TestTrailCheckoutRejectsArgWithTrailFlag(t *testing.T) {
 	t.Parallel()
 
-	cmd := newTrailCheckoutCmd()
+	cmd := newTrailCheckoutCmd(legacyTrailMode)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"feature/b", "--trail", "575"})
@@ -129,7 +131,7 @@ func TestTrailCheckoutRejectsArgWithTrailFlag(t *testing.T) {
 func TestTrailCheckoutHasWorktreeFlag(t *testing.T) {
 	t.Parallel()
 
-	cmd := newTrailCheckoutCmd()
+	cmd := newTrailCheckoutCmd(legacyTrailMode)
 	flag := cmd.Flags().Lookup("worktree")
 	if flag == nil {
 		t.Fatal("worktree flag not registered")

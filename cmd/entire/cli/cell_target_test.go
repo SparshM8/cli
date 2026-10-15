@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,8 +79,11 @@ func TestMatchClusterBySlug(t *testing.T) {
 // fakeCellCore is a stub control plane for resolveRepoCellTarget /
 // resolveRepoCellPlacement tests.
 type fakeCellCore struct {
-	repo        *coreapi.Repo
-	repoErr     error
+	repo    *coreapi.Repo
+	repoErr error
+	// resolution answers POST /repos/resolve; nil resolves nothing.
+	resolution  *coreapi.ResolveReposResponse
+	resolveErr  error
 	clusters    []coreapi.Cluster
 	clustersErr error
 	repos       *coreapi.ListReposOutputBody
@@ -94,6 +98,7 @@ type fakeCellCore struct {
 	// to the requested repo rather than merely returning whatever fixture was
 	// configured regardless of what was asked.
 	lastListReposParams coreapi.ListReposParams
+	mu                  sync.Mutex
 }
 
 // waitIfBlocking simulates a core that accepts the connection and then stalls.
@@ -105,11 +110,57 @@ func (f *fakeCellCore) waitIfBlocking(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (f *fakeCellCore) GetRepo(ctx context.Context, _ coreapi.GetRepoParams) (*coreapi.Repo, error) {
+func (f *fakeCellCore) GetRepo(ctx context.Context, _ coreapi.GetRepoParams) (*coreapi.RepoHeaders, error) {
 	if err := f.waitIfBlocking(ctx); err != nil {
 		return nil, err
 	}
-	return f.repo, f.repoErr
+	return repoHeaders(f.repo, f.repoErr)
+}
+
+// repoHeaders wraps a fake's Repo the way the generated client returns it: the
+// body under Response, alongside response headers the fakes never set.
+func repoHeaders(repo *coreapi.Repo, err error) (*coreapi.RepoHeaders, error) {
+	if repo == nil {
+		return nil, err
+	}
+	return &coreapi.RepoHeaders{Response: *repo}, err
+}
+
+func (f *fakeCellCore) ResolveRepos(ctx context.Context, _ *coreapi.ResolveReposInputBody) (*coreapi.ResolveReposResponse, error) {
+	if err := f.waitIfBlocking(ctx); err != nil {
+		return nil, err
+	}
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	if f.resolution != nil {
+		return f.resolution, nil
+	}
+	return &coreapi.ResolveReposResponse{}, nil
+}
+
+// errProjectLookupRan fails a native-ref resolution that reaches a
+// project-scoped lookup. Those need project#inspect, which a repo-only grant
+// lacks.
+var errProjectLookupRan = errors.New("project lookup must not run for a native ref")
+
+func (f *fakeCellCore) ListProjects(context.Context, coreapi.ListProjectsParams) (*coreapi.ListProjectsOutputBody, error) {
+	return nil, errProjectLookupRan
+}
+
+func (f *fakeCellCore) ListProjectRepos(context.Context, coreapi.ListProjectReposParams) (*coreapi.ListProjectReposOutputBody, error) {
+	return nil, errProjectLookupRan
+}
+
+// nativeResolution is the POST /repos/resolve answer for one ready native repo.
+func nativeResolution(fullName, repoID string) *coreapi.ResolveReposResponse {
+	return &coreapi.ResolveReposResponse{Resolutions: []coreapi.RepoResolution{{
+		Provider:          repoProviderEntire,
+		RequestedFullName: fullName,
+		FullName:          coreapi.NewOptString(fullName),
+		Status:            coreapi.RepoResolutionStatusReady,
+		RepoId:            coreapi.NewOptString(repoID),
+	}}}
 }
 
 func (f *fakeCellCore) ListClusters(context.Context) (*coreapi.ListClustersOutputBody, error) {
@@ -120,7 +171,9 @@ func (f *fakeCellCore) ListClusters(context.Context) (*coreapi.ListClustersOutpu
 }
 
 func (f *fakeCellCore) ListRepos(ctx context.Context, params coreapi.ListReposParams) (*coreapi.ListReposOutputBody, error) {
+	f.mu.Lock()
 	f.lastListReposParams = params
+	f.mu.Unlock()
 	if err := f.waitIfBlocking(ctx); err != nil {
 		return nil, err
 	}
@@ -136,8 +189,107 @@ func (f *fakeCellCore) ListRepos(ctx context.Context, params coreapi.ListReposPa
 func withFakeCellCore(t *testing.T, f *fakeCellCore) {
 	t.Helper()
 	prev := newCellCoreClient
+	prevNative := newNativeRepoCellCoreClient
 	newCellCoreClient = func() (cellCoreClient, error) { return f, nil }
-	t.Cleanup(func() { newCellCoreClient = prev })
+	newNativeRepoCellCoreClient = func() (nativeRepoCellCoreClient, error) { return f, nil }
+	t.Cleanup(func() {
+		newCellCoreClient = prev
+		newNativeRepoCellCoreClient = prevNative
+	})
+}
+
+func TestResolveForgeRepoCellPlacement_NativeDoesNotSelectSameNamedGitHubMirror(t *testing.T) {
+	const (
+		projectID  = "01NATIVEPROJECT00000000000"
+		nativeID   = "01NATIVEREPOSITORY00000000"
+		legacyGHID = "01LEGACYGHMIRROR000000000"
+	)
+	withFakeCellCore(t, &fakeCellCore{
+		resolution: nativeResolution("entirehq/marvin", nativeID),
+		repo: &coreapi.Repo{
+			ID: nativeID, Name: "marvin", OwningProjectId: projectID,
+			ClusterHost: coreapi.NewOptString("eu.entire.io"),
+		},
+		clusters: euClusters(),
+		// This is the forge-blind match the old implementation selected. The
+		// native resolver must never consult it.
+		repos: reposOutput(repoIndexFixture("entirehq/marvin", legacyGHID,
+			placementFixture{id: legacyGHID, slug: usClusterSlug})),
+	})
+
+	got, err := resolveForgeRepoCellPlacement(t.Context(), nativeCloneForge, "entirehq", "marvin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RepoID != nativeID {
+		t.Fatalf("RepoID = %q, want native repo ID %q (not legacy mirror %q)", got.RepoID, nativeID, legacyGHID)
+	}
+	if got.Target.BaseURL != euCellAPIURL || got.Target.Jurisdiction != "eu" {
+		t.Fatalf("Target = %+v, want EU native repo cell", got.Target)
+	}
+}
+
+func TestResolveForgeRepoCellPlacement_RequiresSupportedForge(t *testing.T) {
+	t.Parallel()
+
+	for _, forge := range []string{"", "github", "entire", "gl"} {
+		t.Run(forge, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := resolveForgeRepoCellPlacement(t.Context(), forge, "acme", "widgets")
+			if err == nil || !strings.Contains(err.Error(), "unsupported forge") {
+				t.Fatalf("resolveForgeRepoCellPlacement(%q) error = %v, want unsupported forge", forge, err)
+			}
+		})
+	}
+}
+
+func TestResolveNativeRepoCellPlacement_ClassifiesDefinitiveMisses(t *testing.T) {
+	const (
+		projectID = "01NATIVEPROJECT00000000000"
+		repoID    = "01NATIVEREPOSITORY00000000"
+	)
+	tests := []struct {
+		name               string
+		core               *fakeCellCore
+		wantNotOnboarded   bool
+		wantMessageSnippet string
+	}{
+		{
+			name:               "repo does not resolve",
+			core:               &fakeCellCore{},
+			wantNotOnboarded:   true,
+			wantMessageSnippet: "not found or not shared",
+		},
+		{
+			name:               "repo has no cluster host",
+			core:               &fakeCellCore{resolution: nativeResolution("entirehq/marvin", repoID), repo: &coreapi.Repo{ID: repoID, Name: "marvin", OwningProjectId: projectID}},
+			wantNotOnboarded:   true,
+			wantMessageSnippet: "repo has no cluster host",
+		},
+		{
+			name:               "control plane failure remains retryable",
+			core:               &fakeCellCore{resolveErr: errors.New("core unavailable")},
+			wantNotOnboarded:   false,
+			wantMessageSnippet: "core unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withFakeCellCore(t, tt.core)
+			_, err := resolveNativeRepoCellPlacement(t.Context(), "entirehq", "marvin")
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if got := errors.Is(err, errRepoNotOnboarded); got != tt.wantNotOnboarded {
+				t.Fatalf("errors.Is(err, errRepoNotOnboarded) = %v, want %v (err: %v)", got, tt.wantNotOnboarded, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantMessageSnippet) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantMessageSnippet)
+			}
+		})
+	}
 }
 
 // euClusters is keyed by PublicUrl host, the join the ULID path uses

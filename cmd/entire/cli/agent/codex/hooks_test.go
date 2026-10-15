@@ -3,13 +3,17 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
 	agentpkg "github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/stretchr/testify/require"
-	"os"
-	"path/filepath"
-	"testing"
 )
 
 // setupTestEnv creates a temp dir, sets CWD and CODEX_HOME for test isolation.
@@ -17,6 +21,12 @@ import (
 func setupTestEnv(t *testing.T) string {
 	t.Helper()
 	tempDir := t.TempDir()
+	// Installing hooks anchors a process-wide os.Root on the worktree root
+	// (worktreedir.OpenAt -> osroot.Shared), which is never closed. Windows
+	// cannot remove a directory while a handle to it is open, so the registry
+	// must be closed before t.TempDir's RemoveAll — t.Cleanup is LIFO, and
+	// TempDir registered its removal first, so this runs before it.
+	t.Cleanup(osroot.ResetShared)
 	t.Chdir(tempDir)
 	t.Setenv("CODEX_HOME", filepath.Join(tempDir, ".codex-home"))
 	return tempDir
@@ -127,6 +137,59 @@ func TestInstallHooks_Idempotent(t *testing.T) {
 	count2, err := ag.InstallHooks(context.Background(), false)
 	require.NoError(t, err)
 	require.Equal(t, 0, count2)
+}
+
+func TestInstallHooks_RejectsOversizedHooksFile(t *testing.T) {
+	tempDir := setupTestEnv(t)
+	hooksPath := filepath.Join(tempDir, ".codex", HooksFileName)
+	require.NoError(t, os.MkdirAll(filepath.Dir(hooksPath), 0o750))
+	contents := `{"padding":"` + strings.Repeat("x", maxHooksFileBytes) + `"}`
+	require.NoError(t, os.WriteFile(hooksPath, []byte(contents), 0o600))
+
+	_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
+	require.ErrorContains(t, err, "exceeds 1048576 bytes")
+}
+
+func TestInstallAndUninstallHooks_RejectRedirectedTargets(t *testing.T) {
+	if runtime.GOOS == testWindowsOS {
+		t.Skip("symlink creation is not generally available on Windows")
+	}
+	tempDir := setupTestEnv(t)
+	outside := t.TempDir()
+	outsideHooks := filepath.Join(outside, HooksFileName)
+	require.NoError(t, os.WriteFile(outsideHooks, []byte(`{"keep":true}`), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(tempDir, ".codex")))
+
+	_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
+	require.Error(t, err)
+	data, readErr := os.ReadFile(outsideHooks)
+	require.NoError(t, readErr)
+	require.Equal(t, `{"keep":true}`, string(data))
+
+	require.Error(t, (&CodexAgent{}).UninstallHooks(context.Background()))
+	data, readErr = os.ReadFile(outsideHooks)
+	require.NoError(t, readErr)
+	require.Equal(t, `{"keep":true}`, string(data))
+}
+
+func TestInstallAndUninstallHooks_RejectRedirectedHooksFile(t *testing.T) {
+	if runtime.GOOS == testWindowsOS {
+		t.Skip("symlink creation is not generally available on Windows")
+	}
+	tempDir := setupTestEnv(t)
+	outside := t.TempDir()
+	outsideHooks := filepath.Join(outside, HooksFileName)
+	require.NoError(t, os.WriteFile(outsideHooks, []byte(`{"keep":true}`), 0o600))
+	projectDir := filepath.Join(tempDir, ".codex")
+	require.NoError(t, os.Mkdir(projectDir, 0o750))
+	require.NoError(t, os.Symlink(outsideHooks, filepath.Join(projectDir, HooksFileName)))
+
+	_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
+	require.Error(t, err)
+	require.Error(t, (&CodexAgent{}).UninstallHooks(context.Background()))
+	data, readErr := os.ReadFile(outsideHooks)
+	require.NoError(t, readErr)
+	require.Equal(t, `{"keep":true}`, string(data))
 }
 
 func TestInstallHooks_ReplacesLegacyLocalDevHook(t *testing.T) {
@@ -242,7 +305,23 @@ func TestUninstallHooks(t *testing.T) {
 	err = ag.UninstallHooks(context.Background())
 	require.NoError(t, err)
 
-	require.False(t, ag.AreHooksInstalled(context.Background()))
+	installed, hooksErr := ag.AreHooksInstalled(context.Background())
+	require.NoError(t, hooksErr)
+	require.False(t, installed)
+}
+
+// TestUninstallHooks_UnreadableHooksFileErrors pins the absent-vs-unreadable
+// split: an absent hooks.json means nothing to uninstall, but a read error
+// must surface instead of reporting success with hooks still on disk. The
+// hooks path is created as a directory so os.ReadFile fails with a
+// non-ErrNotExist error on every platform.
+func TestUninstallHooks_UnreadableHooksFileErrors(t *testing.T) {
+	tempDir := setupTestEnv(t)
+
+	require.NoError(t, os.MkdirAll(filepath.Join(tempDir, ".codex", HooksFileName), 0o755))
+
+	require.Error(t, (&CodexAgent{}).UninstallHooks(context.Background()),
+		"UninstallHooks() must error for an unreadable hooks file")
 }
 
 func TestUninstallHooks_PreservesUserHookContainingEntireSubstring(t *testing.T) {
@@ -282,7 +361,9 @@ func TestAreHooksInstalled_NoFile(t *testing.T) {
 	setupTestEnv(t)
 
 	ag := &CodexAgent{}
-	require.False(t, ag.AreHooksInstalled(context.Background()))
+	installed, hooksErr := ag.AreHooksInstalled(context.Background())
+	require.NoError(t, hooksErr)
+	require.False(t, installed)
 }
 
 func TestAreHooksInstalled_WithHooks(t *testing.T) {
@@ -292,7 +373,9 @@ func TestAreHooksInstalled_WithHooks(t *testing.T) {
 	_, err := ag.InstallHooks(context.Background(), false)
 	require.NoError(t, err)
 
-	require.True(t, ag.AreHooksInstalled(context.Background()))
+	installed, hooksErr := ag.AreHooksInstalled(context.Background())
+	require.NoError(t, hooksErr)
+	require.True(t, installed)
 }
 
 func TestAreHooksInstalled_PartialHooks(t *testing.T) {
@@ -314,14 +397,16 @@ func TestAreHooksInstalled_PartialHooks(t *testing.T) {
 	}`), 0o600))
 
 	ag := &CodexAgent{}
-	require.False(t, ag.AreHooksInstalled(context.Background()))
+	installed, hooksErr := ag.AreHooksInstalled(context.Background())
+	require.NoError(t, hooksErr)
+	require.False(t, installed)
 }
 
 // TestAreHooksInstalled_PreSessionEndInstall — a user who enabled Codex before
 // SessionEnd and the subagent hooks joined the install set still counts as
 // installed, so Codex keeps
 // appearing in `entire status` and the agent pickers instead of vanishing until
-// they re-run enable. The gap is drift, and MissingEntireHooks reports it.
+// they re-run enable. The gap is drift, and missingEntireHooks reports it.
 func TestAreHooksInstalled_PreSessionEndInstall(t *testing.T) {
 	tempDir := setupTestEnv(t)
 
@@ -337,8 +422,10 @@ func TestAreHooksInstalled_PreSessionEndInstall(t *testing.T) {
 	}`), 0o600))
 
 	ag := &CodexAgent{}
-	require.True(t, ag.AreHooksInstalled(context.Background()))
-	require.Equal(t, []string{"session_end", "subagent_start", "subagent_stop"}, MissingEntireHooks(tempDir))
+	installed, hooksErr := ag.AreHooksInstalled(context.Background())
+	require.NoError(t, hooksErr)
+	require.True(t, installed)
+	require.Equal(t, []string{"session_end", "subagent_start", "subagent_stop"}, missingEntireHooks(tempDir))
 }
 
 func TestInstallHooks_PreservesExistingHooksJSON(t *testing.T) {
@@ -552,4 +639,92 @@ func TestCommittedDogfoodHooksIsCurrent(t *testing.T) {
 		t.Chdir(dir)
 		return (&CodexAgent{}).InstallHooks(context.Background(), false)
 	})
+}
+
+// readHooksFileForMutation is the read behind InstallHooks, UninstallHooks and
+// AreHooksInstalled. .codex/hooks.json is committed to the repository, so its
+// size, its type and what it points at all arrive through a pull request.
+//
+// The symlink case guards this function's own OpenNoFollow: swapping it for a
+// plain root.Open makes that subtest fail. It does not distinguish this
+// function from the cfg.Read() it replaced, which refused links too.
+func TestReadHooksFileForMutation(t *testing.T) {
+	newConfig := func(t *testing.T, tempDir string) *agentpkg.HookConfigFile {
+		t.Helper()
+		cfg, err := agentpkg.OpenHookConfig(tempDir, ".codex/"+HooksFileName)
+		require.NoError(t, err)
+		return cfg
+	}
+
+	t.Run("an absent file is reported absent, not as an error", func(t *testing.T) {
+		tempDir := setupTestEnv(t)
+		data, exists, err := readHooksFileForMutation(newConfig(t, tempDir))
+		require.NoError(t, err)
+		require.False(t, exists)
+		require.Nil(t, data)
+	})
+
+	// The refusal is what this pins, not its ordering. The bound now comes off
+	// the stat size before any of the file is read, and the outcome of that is
+	// indistinguishable from the post-read length check it replaced, so no
+	// assertion here can tell them apart. What would need a huge sparse file to
+	// observe is the memory the old shape spent getting to the same answer.
+	t.Run("a file over the bound is refused", func(t *testing.T) {
+		tempDir := setupTestEnv(t)
+		hooksPath := filepath.Join(tempDir, ".codex", HooksFileName)
+		require.NoError(t, os.MkdirAll(filepath.Dir(hooksPath), 0o750))
+		require.NoError(t, os.WriteFile(hooksPath, []byte(strings.Repeat("x", maxHooksFileBytes+1)), 0o600))
+
+		_, _, err := readHooksFileForMutation(newConfig(t, tempDir))
+		require.ErrorContains(t, err, "exceeds 1048576 bytes")
+	})
+
+	t.Run("a non-regular file at the hooks path is refused", func(t *testing.T) {
+		tempDir := setupTestEnv(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(tempDir, ".codex", HooksFileName), 0o750))
+
+		_, _, err := readHooksFileForMutation(newConfig(t, tempDir))
+		require.Error(t, err)
+	})
+
+	t.Run("a symlink that stays inside the worktree is refused", func(t *testing.T) {
+		if runtime.GOOS == testWindowsOS {
+			t.Skip("symlink creation is not generally available on Windows")
+		}
+		tempDir := setupTestEnv(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(tempDir, ".codex"), 0o750))
+		victim := filepath.Join(tempDir, "victim.json")
+		require.NoError(t, os.WriteFile(victim, []byte(`{"keep":true}`), 0o600))
+		// Relative and in-repo, so os.Root confinement permits it. Refusing it
+		// is this function's own doing.
+		require.NoError(t, os.Symlink(filepath.Join("..", "victim.json"),
+			filepath.Join(tempDir, ".codex", HooksFileName)))
+
+		_, _, err := readHooksFileForMutation(newConfig(t, tempDir))
+		require.ErrorIs(t, err, osroot.ErrSymlinkedPath)
+
+		data, readErr := os.ReadFile(victim)
+		require.NoError(t, readErr)
+		require.Equal(t, `{"keep":true}`, string(data), "the link target must not be read as ours")
+	})
+}
+
+// missingEntireHooks reports the managed Codex events that are not present in
+// a repository-local hooks file.
+func missingEntireHooks(repoRoot string) []string {
+	document, err := readHooksDocument(filepath.Join(repoRoot, ".codex", HooksFileName))
+	if err != nil || !document.exists {
+		return nil
+	}
+	var missing []string
+	for _, hook := range managedHooks {
+		var groups []MatcherGroup
+		if err := parseHookType(document.rawHooks, hook.event, &groups); err != nil {
+			return nil
+		}
+		if !hasEntireHook(groups) {
+			missing = append(missing, hook.label)
+		}
+	}
+	return missing
 }

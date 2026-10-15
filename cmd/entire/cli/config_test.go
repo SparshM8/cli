@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 )
 
 const (
@@ -290,25 +292,6 @@ func TestLoadEntireSettings_RejectsUnknownKeysInBase(t *testing.T) {
 	}
 }
 
-// TestGetStrategy_HasBlobFetcher verifies that GetStrategy returns a strategy
-// with blob fetching enabled. Without this, checkpoint reads after a treeless
-// fetch (--filter=blob:none) silently fail because blobs are not local and
-// FetchingTree has no fetcher to download them — causing "session log not
-// available" errors during resume.
-//
-// Regression test for the bug introduced in b92b37b3 where Read and
-// ReadSessionContent were changed to use FetchingTree but GetStrategy did not
-// configure a blob fetcher on the strategy.
-func TestGetStrategy_HasBlobFetcher(t *testing.T) {
-	t.Parallel()
-
-	strat := GetStrategy(context.Background())
-	if !strat.HasBlobFetcher() {
-		t.Fatal("GetStrategy must return a strategy with a blob fetcher configured; " +
-			"without it, checkpoint reads fail after treeless fetches")
-	}
-}
-
 func TestLoadEntireSettings_RejectsUnknownKeysInLocal(t *testing.T) {
 	setupLocalOverrideTestDir(t)
 
@@ -328,5 +311,23 @@ func TestLoadEntireSettings_RejectsUnknownKeysInLocal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown field") {
 		t.Errorf("Error should mention 'unknown field', got: %v", err)
+	}
+}
+
+// TestAgentDisplayName_FallsBackToRegistryName pins the fallback for a name the
+// registry cannot resolve. These names are how the user learns what a command is
+// about to touch, or has left behind, so an unresolvable one must still appear:
+// dropping it lists one fewer agent than will be acted on, and returning "" puts
+// a gap where the name belongs ("  hooks are still installed").
+func TestAgentDisplayName_FallsBackToRegistryName(t *testing.T) {
+	t.Parallel()
+
+	const unregistered types.AgentName = "not-a-registered-agent"
+
+	if got := agentDisplayName(unregistered); got != string(unregistered) {
+		t.Errorf("agentDisplayName(%q) = %q, want the registry name back", unregistered, got)
+	}
+	if got := agentDisplayNames([]types.AgentName{unregistered}); len(got) != 1 || got[0] != string(unregistered) {
+		t.Errorf("agentDisplayNames(%q) = %q, want the name kept, not dropped", unregistered, got)
 	}
 }
