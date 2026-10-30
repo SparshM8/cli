@@ -231,7 +231,7 @@ func documentedBuiltinCapabilities(t *testing.T) ([]string, []string) {
 //
 // Agents should depend only on:
 //   - The agent contract package (agent, agent/types, agent/testutil)
-//   - Utility packages (logging, paths, jsonutil, textutil, transcript, etc.)
+//   - Utility packages (logging, paths, jsonutil, transcript, etc.)
 //   - Standard library and external dependencies
 func TestAgentPackages_NoForbiddenImports(t *testing.T) {
 	t.Parallel()
@@ -261,7 +261,6 @@ func TestAgentPackages_NoForbiddenImports(t *testing.T) {
 		repoPrefix + "entiredir",  // the shared .entire root; the only sanctioned way to read or write there
 		repoPrefix + "osroot",     // traversal-resistant os.Root helpers, used with the above
 		repoPrefix + "jsonutil",   // JSON utilities
-		repoPrefix + "textutil",   // text utilities
 		repoPrefix + "transcript", // transcript utilities
 		repoPrefix + "trailers",   // git trailer utilities
 		repoPrefix + "stringutil", // string utilities
@@ -283,6 +282,12 @@ func TestAgentPackages_NoForbiddenImports(t *testing.T) {
 			// a per-conversation flock around its dedup-and-append. No other
 			// agent's transport has that shape.
 			repoPrefix + "internal/flock",
+		},
+		"opencode": {
+			// Process-group kill on cancel. opencode's npm launcher runs the
+			// real binary as a child with inherited stdio, so killing the
+			// launcher alone leaves an export blocking past its deadline.
+			repoPrefix + "execx",
 		},
 	}
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
@@ -46,9 +47,19 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 
 	// Hash the step's files before taking the session lock: it is a git
 	// subprocess, and the lock serializes every hook of this session.
-	worktreeRoot, err := paths.WorktreeRoot(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get worktree root: %w", err)
+	worktreeRoot := step.WorktreeRoot
+	if worktreeRoot == "" {
+		if worktreeRoot, err = paths.WorktreeRoot(ctx); err != nil {
+			return fmt.Errorf("failed to get worktree root: %w", err)
+		}
+	} else {
+		// The base comes from that worktree's HEAD, not the hook's.
+		stepRepo, openErr := gitrepo.OpenPath(worktreeRoot)
+		if openErr != nil {
+			return fmt.Errorf("failed to open the step's worktree: %w", openErr)
+		}
+		defer stepRepo.Close()
+		repo = stepRepo
 	}
 	changedFiles := make([]string, 0, len(step.ModifiedFiles)+len(step.NewFiles))
 	changedFiles = append(changedFiles, step.ModifiedFiles...)
@@ -65,6 +76,16 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 	recordedDeletions := withoutPaths(step.DeletedFiles, stagedOnlyDeletions(ctx, worktreeRoot, step.DeletedFiles))
 
 	mutErr := MutateSessionState(ctx, sessionID, func(state *SessionState) error {
+		// A step in a worktree other than the session's home records into
+		// that worktree's entry (see enterWorktreeView), never the home's.
+		if leave, inView := enterStepWorktree(ctx, state, worktreeRoot); inView {
+			defer leave()
+			if state.BaseCommit == "" {
+				if head, headErr := repo.Head(); headErr == nil {
+					state.BaseCommit = head.Hash().String()
+				}
+			}
+		}
 		invalidateStaleSubagentSnapshot(&step, state)
 		if err := syncBaseCommitToHead(ctx, repo, state); err != nil {
 			return err
@@ -89,7 +110,9 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 		// LastCheckpointID is intentionally NOT cleared here. It is set during
 		// condensation and used by handleAmendCommitMsg to restore checkpoint
 		// trailers on amend operations.
-		state.StepCount++
+		if !step.SameTurn {
+			state.StepCount++
+		}
 		state.FilesTouched = mergeFilesTouched(state.FilesTouched, step.ModifiedFiles, step.NewFiles, step.DeletedFiles)
 		applyTouchedFileHashes(state, changedFiles, stepFileHashes, recordedDeletions)
 		recordUntrackedDeletions(worktreeRoot, state, untrackedGone)
@@ -97,52 +120,7 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 		if state.StepCount == 1 {
 			state.TranscriptIdentifierAtStart = step.StepTranscriptIdentifier
 		}
-		if step.TokenUsage != nil {
-			state.TokenUsage = accumulateTokenUsage(state.TokenUsage, step.TokenUsage)
-			state.CheckpointTokenUsage = accumulateTokenUsage(state.CheckpointTokenUsage, step.TokenUsage)
-			// step.TokenUsage.SubagentTokens is a cumulative-since-session-start
-			// snapshot (agent IDs are discovered from the full transcript and each
-			// subagent's own transcript is re-read from its start on every call —
-			// see CalculateTotalTokenUsage in the claudecode/factoryaidroid
-			// packages), not a per-step delta like the rest of TokenUsage.
-			// accumulateTokenUsage already replaces (rather than adds) the
-			// SubagentTokens field for that reason, so state.TokenUsage ends up
-			// correctly holding the latest cumulative total. CheckpointTokenUsage
-			// additionally needs rescoping to "since last condensation" by
-			// subtracting the baseline captured at the last reset, otherwise the
-			// full cumulative subagent total would be reported again at every
-			// checkpoint instead of just this checkpoint's share.
-			//
-			// Derive the checkpoint delta FRESH each call from the session-wide
-			// cumulative (state.TokenUsage.SubagentTokens) minus the baseline —
-			// do NOT mutate CheckpointTokenUsage.SubagentTokens in place. A later
-			// step in the same window can carry step.TokenUsage != nil but
-			// SubagentTokens == nil (the subagent transcript was cleaned up, so
-			// CalculateTotalTokenUsage returned APICallCount==0 and left it nil);
-			// accumulateTokenUsage then leaves CheckpointTokenUsage.SubagentTokens
-			// at its already-rescoped value, and re-subtracting the baseline from
-			// that would double-subtract and (via clampSubtract) shrink or zero a
-			// real subagent total. Recomputing from the session-wide cumulative
-			// is idempotent regardless of whether this step carried a snapshot.
-			if state.CheckpointTokenUsage != nil && state.TokenUsage != nil {
-				complete := state.TokenUsage.SubagentTokensComplete
-				switch {
-				case complete != nil && !*complete:
-					state.CheckpointTokenUsage = types.WithClearedSubagentTokens(state.CheckpointTokenUsage, false)
-				case state.SubagentTokensBaselineComplete != nil && !*state.SubagentTokensBaselineComplete:
-					// A known-incomplete baseline cannot yield an exact delta, even
-					// when the current inventory has become complete again.
-					state.CheckpointTokenUsage = types.WithClearedSubagentTokens(state.CheckpointTokenUsage, false)
-				default:
-					state.CheckpointTokenUsage.SubagentTokens = types.SubtractTokenUsage(
-						state.TokenUsage.SubagentTokens, state.SubagentTokensBaseline)
-					if complete != nil {
-						value := *complete
-						state.CheckpointTokenUsage.SubagentTokensComplete = &value
-					}
-				}
-			}
-		}
+		applyTurnTokenUsage(state, step.TokenUsage)
 
 		logCtx := logging.WithComponent(ctx, "checkpoint")
 		logging.Info(logCtx, "checkpoint saved",
@@ -163,13 +141,75 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 }
 
 func invalidateStaleSubagentSnapshot(step *StepContext, state *SessionState) {
-	if step.SubagentLedgerVersion == nil || step.TokenUsage == nil ||
-		state.SubagentLedgerVersion == *step.SubagentLedgerVersion {
-		return
+	step.TokenUsage = withoutStaleSubagentSnapshot(step.TokenUsage, step.SubagentLedgerVersion, state)
+}
+
+// withoutStaleSubagentSnapshot drops usage's child aggregate when it was
+// computed against a subagent ledger version other than the one state holds.
+func withoutStaleSubagentSnapshot(usage *agent.TokenUsage, ledgerVersion *uint64, state *SessionState) *agent.TokenUsage {
+	if ledgerVersion == nil || usage == nil || state.SubagentLedgerVersion == *ledgerVersion {
+		return usage
 	}
 	// Keep valid main-agent deltas but never persist a child aggregate
 	// computed against an older authoritative inventory.
-	step.TokenUsage = types.WithClearedSubagentTokens(step.TokenUsage, false)
+	return types.WithClearedSubagentTokens(usage, false)
+}
+
+// applyTurnTokenUsage records one turn's token usage on state: it adds the
+// per-turn counters to both the session total (TokenUsage) and the pending
+// checkpoint window (CheckpointTokenUsage), and rescopes the window's
+// cumulative SubagentTokens against the baseline. SaveStep and
+// ApplyTurnTokenUsage (turns that change no files) both go through
+// here, so a turn is accounted the same way whichever path records it. A nil
+// usage is a no-op.
+func applyTurnTokenUsage(state *SessionState, usage *agent.TokenUsage) {
+	if usage == nil {
+		return
+	}
+	state.TokenUsage = accumulateTokenUsage(state.TokenUsage, usage)
+	state.CheckpointTokenUsage = accumulateTokenUsage(state.CheckpointTokenUsage, usage)
+	// usage.SubagentTokens is a cumulative-since-session-start
+	// snapshot (agent IDs are discovered from the full transcript and each
+	// subagent's own transcript is re-read from its start on every call —
+	// see CalculateTotalTokenUsage in the claudecode/factoryaidroid
+	// packages), not a per-step delta like the rest of TokenUsage.
+	// accumulateTokenUsage already replaces (rather than adds) the
+	// SubagentTokens field for that reason, so state.TokenUsage ends up
+	// correctly holding the latest cumulative total. CheckpointTokenUsage
+	// additionally needs rescoping to "since last condensation" by
+	// subtracting the baseline captured at the last reset, otherwise the
+	// full cumulative subagent total would be reported again at every
+	// checkpoint instead of just this checkpoint's share.
+	//
+	// Derive the checkpoint delta FRESH each call from the session-wide
+	// cumulative (state.TokenUsage.SubagentTokens) minus the baseline —
+	// do NOT mutate CheckpointTokenUsage.SubagentTokens in place. A later
+	// step in the same window can carry usage != nil but
+	// SubagentTokens == nil (the subagent transcript was cleaned up, so
+	// CalculateTotalTokenUsage returned APICallCount==0 and left it nil);
+	// accumulateTokenUsage then leaves CheckpointTokenUsage.SubagentTokens
+	// at its already-rescoped value, and re-subtracting the baseline from
+	// that would double-subtract and (via clampSubtract) shrink or zero a
+	// real subagent total. Recomputing from the session-wide cumulative
+	// is idempotent regardless of whether this step carried a snapshot.
+	if state.CheckpointTokenUsage != nil && state.TokenUsage != nil {
+		complete := state.TokenUsage.SubagentTokensComplete
+		switch {
+		case complete != nil && !*complete:
+			state.CheckpointTokenUsage = types.WithClearedSubagentTokens(state.CheckpointTokenUsage, false)
+		case state.SubagentTokensBaselineComplete != nil && !*state.SubagentTokensBaselineComplete:
+			// A known-incomplete baseline cannot yield an exact delta, even
+			// when the current inventory has become complete again.
+			state.CheckpointTokenUsage = types.WithClearedSubagentTokens(state.CheckpointTokenUsage, false)
+		default:
+			state.CheckpointTokenUsage.SubagentTokens = types.SubtractTokenUsage(
+				state.TokenUsage.SubagentTokens, state.SubagentTokensBaseline)
+			if complete != nil {
+				value := *complete
+				state.CheckpointTokenUsage.SubagentTokensComplete = &value
+			}
+		}
+	}
 }
 
 // ensureSessionInitialized creates the session state file if it doesn't yet
@@ -285,6 +325,30 @@ func applyTaskRecordCompletion(state *SessionState, rec session.TaskRecord) erro
 // their record. Returns false without error when a racing Final event already
 // completed the record, or when no session state exists.
 func CompleteTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord) (bool, error) {
+	return completeTaskRecord(ctx, sessionID, rec, nil)
+}
+
+// CompleteChildSessionTaskRecord is CompleteTaskRecord for a subagent that
+// runs as a session of its own, whose usage the parent's transcript never
+// carries (OpenCode child sessions). The completion that claims the record
+// also credits rec.TokenUsage to the session's ChildSessionTokens, unless an
+// earlier stop for the same call already did (State.CreditedChildCalls): a
+// stop repeated after condensation removed the record claims a fresh record,
+// but its usage is not counted twice. callStartedAt is the call start the
+// agent reported, zero when unknown.
+// The credit lands in the checkpoint that stores the child's task record,
+// except after an attach (see ConsumeAttachTokenWindow).
+func CompleteChildSessionTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord, callStartedAt time.Time) (bool, error) {
+	call := &session.CreditedChildCall{ToolUseID: rec.ToolUseID, AgentID: rec.AgentID}
+	if !callStartedAt.IsZero() {
+		call.StartedAtMs = callStartedAt.UnixMilli()
+	}
+	return completeTaskRecord(ctx, sessionID, rec, call)
+}
+
+// completeTaskRecord claims and completes rec's record. A non-nil credit
+// also credits rec.TokenUsage as a child session's usage, once per call.
+func completeTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord, credit *session.CreditedChildCall) (bool, error) {
 	completed := false
 	mutErr := MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 		if state.FindTaskRecord(rec.ToolUseID) == nil {
@@ -295,6 +359,9 @@ func CompleteTaskRecord(ctx context.Context, sessionID string, rec session.TaskR
 		}
 		if err := applyTaskRecordCompletion(state, rec); err != nil {
 			return err
+		}
+		if credit != nil && state.ClaimChildCallCredit(*credit) {
+			state.AddChildSessionTokens(rec.TokenUsage)
 		}
 		completed = true
 		return nil
@@ -310,14 +377,39 @@ func CompleteTaskRecord(ctx context.Context, sessionID string, rec session.TaskR
 // (Factory Droid Workers reach turn-end once per Worker turn, all attributed
 // to one parent tool use), unlike CompleteTaskRecord's exactly-once claim.
 func UpsertCompletedTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord) error {
+	return upsertCompletedTaskRecord(ctx, sessionID, rec, false)
+}
+
+// UpsertCompletedTaskRecordTurn is UpsertCompletedTaskRecord for a producer
+// that reports usage per turn (Factory Droid Workers): rec.TokenUsage is this
+// turn's delta and is added to the record's usage rather than replacing it,
+// and to the session's ChildSessionTokens. The caller's turn-end transition
+// claim makes each turn arrive here once.
+// Condensation removes a completed record once stored, so a later turn starts
+// a fresh record holding only usage no checkpoint has yet.
+func UpsertCompletedTaskRecordTurn(ctx context.Context, sessionID string, rec session.TaskRecord) error {
+	return upsertCompletedTaskRecord(ctx, sessionID, rec, true)
+}
+
+func upsertCompletedTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord, addUsage bool) error {
+	turnUsage := rec.TokenUsage
 	return MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 		if existing := state.FindTaskRecord(rec.ToolUseID); existing != nil {
 			rec.Files = mergeFilesTouched(existing.Files, rec.Files)
+			if addUsage && rec.TokenUsage != nil {
+				rec.TokenUsage = types.AddTokenUsage(existing.TokenUsage, turnUsage)
+			}
 		} else {
 			state.AddTaskRecord(launchStubTaskRecord(rec))
 		}
 		state.CompleteTaskRecord(rec.ToolUseID, time.Now())
-		return applyTaskRecordCompletion(state, rec)
+		if err := applyTaskRecordCompletion(state, rec); err != nil {
+			return err
+		}
+		if addUsage {
+			state.AddChildSessionTokens(turnUsage)
+		}
+		return nil
 	})
 }
 
